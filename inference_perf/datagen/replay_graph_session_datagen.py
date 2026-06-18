@@ -28,6 +28,7 @@ import logging
 import re
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field, replace as dc_replace
 from multiprocessing.managers import SyncManager
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -50,6 +51,7 @@ from inference_perf.config import APIConfig, APIType, DataConfig, SessionReplayC
 from inference_perf.config.datagen.replay import BadToolCallHandling
 from inference_perf.datagen.base import LazyLoadDataMixin, SessionGenerator
 from inference_perf.datagen.replay_graph_types import InputSegment, ReplayGraph
+from inference_perf.models import ReuseSegment
 from inference_perf.utils.custom_tokenizer import CustomTokenizer
 
 logger = logging.getLogger(__name__)
@@ -97,6 +99,50 @@ def _detect_bad_tool_calls(
 
 
 # --- end bad_tool_call_handling --------------------------------------------
+
+
+def _compute_reuse_profiles(events) -> Dict[str, List[ReuseSegment]]:
+    """Build each producer's reuse-depth profile from consumers' input_segments.
+
+    A consumer reuses only the LEADING contiguous run of shared/output segments
+    (the first 'unique' segment breaks prefix-cache contiguity). breadth(t) =
+    #consumers reusing >= t tokens. Producers with no reuse are absent (terminal)."""
+    by_id = {e.event_id: e for e in events}
+    all_starts = sorted(e.t_start_ms for e in events)
+    # pid -> [(reused_tokens, consumer_t_start_ms)]
+    consumers: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    for c in events:
+        reused_per_pred: Dict[str, int] = defaultdict(int)
+        for seg in c.call.input_segments:
+            if seg.type == "unique":
+                break  # prefix-cache contiguity ends at the consumer's first own/new content
+            if seg.source_event_id is not None:  # leading shared/output run
+                reused_per_pred[seg.source_event_id] += seg.token_count
+        for sid, toks in reused_per_pred.items():
+            if toks <= 0:
+                continue
+            if by_id.get(sid) is None:
+                continue
+            consumers[sid].append((toks, c.t_start_ms))
+    profiles: Dict[str, List[ReuseSegment]] = {}
+    for sid, lst in consumers.items():
+        prod_end = by_id[sid].t_end_ms
+        prev = 0
+        segs = []
+        for b in sorted({t for t, _ in lst}):
+            covering = [(t, cs) for t, cs in lst if t >= b]
+            farthest_start = max(cs for _, cs in covering)
+            # Spans running during the idle window (producer end -> farthest
+            # reuse start); the policy turns this count into a TTL.
+            intervening = sum(1 for st in all_starts if prod_end < st < farthest_start)
+            segs.append(ReuseSegment(
+                start=prev, end=b,
+                breadth=len(covering),
+                intervening_spans=intervening,
+            ))
+            prev = b
+        profiles[sid] = segs
+    return profiles
 
 
 class EventFailedError(Exception):
@@ -298,6 +344,10 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
     # early (e.g. recorded fallback also malformed). Lets the caller pass the
     # right reason string to _fail_and_notify instead of a generic fallback.
     _substitution_failure_reason: Optional[str] = None
+    # KV-cache retention policy (WorkflowAwarePolicy) for directive injection
+    retention_policy: Any = None
+    # Per-producer reuse-depth profile. None = not reused → no directive (EVICT).
+    reuse_depth_profile: Optional[List[ReuseSegment]] = None
 
     async def to_request_body(
         self, effective_model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool
@@ -336,7 +386,22 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                 # - there were multiple tool calls (vLLM only accepts one name at a time).
                 payload["tool_choice"] = "required"
 
+        if self.retention_policy is not None:
+            extra = self._compute_retention_extra_body()
+            if extra:
+                existing_extra = payload.get("extra_body") or {}
+                existing_extra.update(extra)
+                payload["extra_body"] = existing_extra
+
         return payload
+
+    def _compute_retention_extra_body(self) -> Optional[Dict[str, Any]]:
+        """Invoke the retention policy with this event's reuse-depth profile to
+        build the extra_body retention_directives (None if no profile)."""
+        return self.retention_policy.compute_directives(
+            reuse_depth_profile=self.reuse_depth_profile,
+            scope=self._extract_session_id(),
+        )
 
     def _extract_session_id(self) -> str:
         return self.event_id.split(":")[0] if ":" in self.event_id else self.event_id
@@ -956,6 +1021,7 @@ class ReplaySessionEvent:
     predecessor_event_ids: List[str] = field(default_factory=list)
     wait_ms: int = 0
     tool_definitions: Optional[List[Dict[str, Any]]] = None
+    reuse_depth_profile: Optional[List[ReuseSegment]] = None
 
 
 @dataclass
@@ -981,6 +1047,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
         base_seed: Optional[int] = None,
         num_workers: int = 1,
         replay_config: Optional[SessionReplayConfig] = None,
+        retention_policy: Any = None,
     ) -> None:
         super().__init__(api_config, config, tokenizer)
         self.config = config
@@ -988,6 +1055,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
         self.mp_manager = mp_manager
         self.num_workers = max(1, num_workers)
         self.base_seed = base_seed if base_seed is not None else 42
+        self.retention_policy = retention_policy
 
         self.output_registry = EventOutputRegistry()
         self.worker_tracker = WorkerSessionTracker()
@@ -1120,6 +1188,8 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
             )
             self.session_graph_state[session.session_id] = state
 
+            reuse_profiles = _compute_reuse_profiles(list(session.graph.events.values()))
+
             for event in session.graph.events.values():
                 gc = event.call
 
@@ -1153,6 +1223,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
                         predecessor_event_ids=qualified_predecessor_ids,
                         wait_ms=min(event.wait_ms, self.replay_config.max_wait_ms) if self.replay_config else event.wait_ms,
                         tool_definitions=gc.tool_definitions,
+                        reuse_depth_profile=reuse_profiles.get(event.event_id),
                     )
                 )
 
@@ -1362,6 +1433,8 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
 
         gc = state.graph.events[raw_event_id].call if state and raw_event_id in state.graph.events else None
 
+        retention_policy = getattr(self, "retention_policy", None)
+
         return SessionChatCompletionAPIData(
             messages=chat_messages,
             max_tokens=max_tokens,
@@ -1390,6 +1463,9 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
             bad_tool_call_handling=getattr(self.replay_config, "bad_tool_call_handling", BadToolCallHandling.NONE)
             if self.replay_config
             else BadToolCallHandling.NONE,
+            # Retention policy (KV-cache retention directive injection)
+            retention_policy=retention_policy,
+            reuse_depth_profile=event.reuse_depth_profile,
         )
 
     def cleanup_session(self, session_id: str) -> None:

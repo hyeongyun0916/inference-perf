@@ -248,3 +248,27 @@ class WekaTraceReplayConfig(SessionReplayConfig):
                 "Cannot specify multiple trace sources; choose one of: trace_directory, trace_files, or hf_dataset_path"
             )
         return self
+
+
+class RetentionPolicyConfig(BaseModel):
+    """Configuration for KV-cache retention directives.
+
+    Controls whether and how retention_directives are injected into
+    inference requests during agentic / trace-replay workloads. Used to
+    instruct the server to protect KV-cache blocks from eviction during
+    tool-call pauses.
+    """
+
+    type: str = Field(
+        default="workflow_aware",
+        description="Policy type: 'workflow_aware' (DAG oracle TTL + breadth-tier priority + evict-if-unused).",
+    )
+    # Reuse-breadth priority tiers (breadth >=4 -> high, >=2 -> mid, else low).
+    high_breadth_priority: int = Field(default=90, ge=0, le=100)
+    mid_breadth_priority: int = Field(default=70, ge=0, le=100)
+    low_breadth_priority: int = Field(default=50, ge=0, le=100)
+    ttl_buffer_s: float = Field(
+        default=5.0,
+        ge=0,
+        description="Extra seconds added to the per-segment idle-gap TTL",
+    )

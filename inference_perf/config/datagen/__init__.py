@@ -33,6 +33,7 @@ from inference_perf.config.datagen.multimodal import (
 from inference_perf.config.datagen.replay import (
     ConversationReplayConfig,
     OTelTraceReplayConfig,
+    RetentionPolicyConfig,
     SessionReplayConfig,
     TraceConfig,
     TraceFormat,
@@ -49,6 +50,7 @@ __all__ = [
     "ImageDatagenConfig",
     "MediaDatagenConfig",
     "OTelTraceReplayConfig",
+    "RetentionPolicyConfig",
     "Resolution",
     "ResolutionPreset",
     "SessionReplayConfig",
