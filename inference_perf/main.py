@@ -128,6 +128,8 @@ def _build_retention_policy(cfg: Any) -> Any:
             high_breadth_priority=cfg.high_breadth_priority,
             mid_breadth_priority=cfg.mid_breadth_priority,
             low_breadth_priority=cfg.low_breadth_priority,
+            per_span_s=cfg.per_span_s,
+            queue_margin_s=cfg.queue_margin_s,
         )
     raise ValueError(f"Unknown retention policy type: {policy_type!r}")
 

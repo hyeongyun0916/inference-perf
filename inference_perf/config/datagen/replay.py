@@ -272,3 +272,15 @@ class RetentionPolicyConfig(BaseModel):
         ge=0,
         description="Extra seconds added to the per-segment idle-gap TTL",
     )
+    per_span_s: float = Field(
+        default=9.0,
+        gt=0,
+        description="Estimated wall-clock seconds per intervening span; the "
+        "per-segment TTL scales as intervening_spans * per_span_s. Raise to "
+        "match the workload's actual per-turn latency.",
+    )
+    queue_margin_s: float = Field(
+        default=10.0,
+        ge=0,
+        description="Queue-wait margin added to each per-segment idle-gap TTL.",
+    )
