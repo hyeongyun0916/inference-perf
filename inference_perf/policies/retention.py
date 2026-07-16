@@ -34,9 +34,10 @@ class WorkflowAwarePolicy:
 
       - breadth: how many later calls reuse up to `end`. Higher breadth ->
         higher priority tier (high/mid/low).
-      - intervening_spans: calls running during the idle gap before the
-        farthest reuse. TTL = intervening_spans * per_span_s + queue_margin_s
-        + ttl_buffer_s.
+      - cold_gap: longest run of intervening calls the region goes untouched
+        between consecutive reuses. TTL = cold_gap * per_span_s + queue_margin_s
+        + ttl_buffer_s, so a recency-hot region (cold_gap ~= 0) gets only the
+        margins and is not over-retained.
 
     No profile (output never reused) -> no directive (immediate LRU evict).
     """
@@ -69,7 +70,7 @@ class WorkflowAwarePolicy:
         directives: list[dict[str, Any]] = []
         for seg in profile:
             duration = (
-                seg.intervening_spans * self.per_span_s
+                seg.cold_gap * self.per_span_s
                 + self.queue_margin_s
                 + self.ttl_buffer_s
             )

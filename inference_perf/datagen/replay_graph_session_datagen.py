@@ -143,24 +143,35 @@ def _compute_reuse_profiles(events) -> Dict[str, List[ReuseSegment]]:
         # Ranged segments for prompt-prefix reuse (breadth tiers by depth).
         for b in sorted({t for t, _, _ in lst if t > 0}):
             covering = [cs for t, cs, _ in lst if t >= b]
-            # Spans running during the idle window (producer end -> farthest
-            # reuse start); the policy turns this count into a TTL.
-            intervening = sum(1 for st in all_starts if prod_end < st < max(covering))
+            # Longest untouched run between consecutive uses: recency-hot ->
+            # ~0, a genuine set-aside -> large (gap-to-farthest would conflate
+            # the two and over-retain hot regions).
+            marks = sorted([prod_end] + covering)
+            cold_gap = max(
+                (sum(1 for st in all_starts if marks[i] < st < marks[i + 1])
+                 for i in range(len(marks) - 1)),
+                default=0,
+            )
             segs.append(ReuseSegment(
                 start=prev, end=b,
                 breadth=len(covering),
-                intervening_spans=intervening,
+                cold_gap=cold_gap,
             ))
             prev = b
         # One flag segment if any consumer reuses the producer's OUTPUT. No
         # range: the server protects the post-prompt region it generates.
         out_starts = [cs for _, cs, o in lst if o]
         if out_starts:
-            intervening = sum(1 for st in all_starts if prod_end < st < max(out_starts))
+            marks = sorted([prod_end] + out_starts)
+            cold_gap = max(
+                (sum(1 for st in all_starts if marks[i] < st < marks[i + 1])
+                 for i in range(len(marks) - 1)),
+                default=0,
+            )
             segs.append(ReuseSegment(
                 start=prev, end=prev,
                 breadth=len(out_starts),
-                intervening_spans=intervening,
+                cold_gap=cold_gap,
                 covers_output=True,
             ))
         profiles[sid] = segs

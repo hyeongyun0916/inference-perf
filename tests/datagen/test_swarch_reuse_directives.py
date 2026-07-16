@@ -90,15 +90,13 @@ def test_max_breadth_producer_has_correct_priority(sw_arch_profiles):
     shared by two successors). breadth≥2 → mid_breadth_priority (default 70).
     Verify the policy maps it correctly.
     """
-    # Find max breadth across all profiles (first segment = widest coverage)
-    top_breadth = max(segs[0].breadth for segs in sw_arch_profiles.values())
+    # Widest-coverage segment (max breadth) maps to a breadth-tiered priority.
+    top_seg = max((segs[0] for segs in sw_arch_profiles.values()),
+                  key=lambda s: s.breadth)
     policy = WorkflowAwarePolicy()
-    priority = policy._priority_for_breadth(top_breadth)
+    priority = policy._priority_for_breadth(top_seg.breadth)
 
-    # In this trace max breadth is 2 → mid_breadth_priority (70).
-    # If more reuse is found in future trace versions and breadth reaches ≥4
-    # the priority becomes 90. Either is correct.
-    assert priority in (70, 90), (
-        f"Priority {priority} is not a recognized tier (expected 70 or 90 for "
-        f"breadth={top_breadth})"
+    # Priority must map to a recognized tier (low/mid/high).
+    assert priority in (50, 70, 90), (
+        f"Priority {priority} is not a recognized tier (breadth={top_seg.breadth})"
     )

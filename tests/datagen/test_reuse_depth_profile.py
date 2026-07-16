@@ -71,13 +71,28 @@ def test_output_reuse_becomes_covers_output_flag():
     assert seg.breadth == 1
 
 
-def test_intervening_spans_counted():
-    # S produces at [0,1000]; X,Y run during the idle gap; C reuses S at t=6000.
-    # intervening = events with t_start in (S.t_end=1000, C.t_start=6000) = X,Y = 2.
+def test_cold_gap_counted():
+    # S produces at [0,1000]; X,Y run during the idle gap; C reuses S once at
+    # t=6000. cold_gap = spans starting in (S.t_end=1000, C.t_start=6000) = X,Y = 2.
     S = _ev("S", 0, 1000, [], [])
     X = _ev("X", 2000, 3000, [_seg(None, 10, typ="unique")], [])
     Y = _ev("Y", 4000, 5000, [_seg(None, 10, typ="unique")], [])
     C = _ev("C", 6000, 7000, [_seg("S", 100)], ["S"])
     profiles = _compute_reuse_profiles([S, X, Y, C])
-    assert profiles["S"][0].intervening_spans == 2
+    assert profiles["S"][0].cold_gap == 2
     assert profiles["S"][0].end == 100
+
+
+def test_cold_gap_ignores_frequent_reuse():
+    # S is reused every step (t=2000,3000,4000,5000) -> recency-hot -> the region
+    # never goes untouched -> cold_gap == 0, even though the FARTHEST reuse is 3
+    # spans away (the old gap-to-farthest metric would have reported 3). This is
+    # the shortlisting-catalog case: LRU keeps it hot, retention must not pin it.
+    S = _ev("S", 0, 1000, [], [])
+    consumers = [
+        _ev(f"C{i}", t, t + 500, [_seg("S", 100)], ["S"])
+        for i, t in enumerate([2000, 3000, 4000, 5000])
+    ]
+    profiles = _compute_reuse_profiles([S, *consumers])
+    assert profiles["S"][0].breadth == 4
+    assert profiles["S"][0].cold_gap == 0

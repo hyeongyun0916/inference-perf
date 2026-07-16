@@ -21,14 +21,15 @@ class ReuseSegment(BaseModel):
     """One step of a producing call's reuse-depth profile.
 
     Over the producer's own token positions [start, end): how many later
-    calls reuse a prefix reaching at least `end` tokens (`breadth`), and how
-    many calls run during the idle gap before the farthest such reuse
-    (`intervening_spans`, the TTL basis). breadth is non-increasing with depth,
-    so directives derived from it satisfy the prefix-cache
-    non-increasing-priority constraint automatically.
+    calls reuse a prefix reaching at least `end` tokens (`breadth`), and the
+    longest run of intervening calls this region goes untouched between
+    consecutive reuses (`cold_gap`, the TTL basis — the region must survive at
+    least this long to still be cached at its next reuse). breadth is
+    non-increasing with depth, so directives derived from it satisfy the
+    prefix-cache non-increasing-priority constraint automatically.
     """
     start: int = Field(..., ge=0, description="Token start position (inclusive)")
     end: int = Field(..., ge=0, description="Token end position (exclusive)")
     breadth: int = Field(..., ge=1, description="Number of future calls reusing up to `end`")
-    intervening_spans: int = Field(default=0, ge=0, description="Calls running during the idle gap before the FARTHEST reuse of this region; TTL basis (real idle ~= intervening_spans * per-span latency)")
+    cold_gap: int = Field(default=0, ge=0, description="Max consecutive intervening calls this region goes untouched between reuses; TTL basis (a recency-hot region has cold_gap ~= 0 and needs no retention)")
     covers_output: bool = Field(default=False, description="Covers the producer's generated output; start/end are ignored and the server protects the post-prompt region it generates.")

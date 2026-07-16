@@ -276,7 +276,7 @@ class RetentionPolicyConfig(BaseModel):
         default=9.0,
         gt=0,
         description="Estimated wall-clock seconds per intervening span; the "
-        "per-segment TTL scales as intervening_spans * per_span_s. Raise to "
+        "per-segment TTL scales as cold_gap * per_span_s. Raise to "
         "match the workload's actual per-turn latency.",
     )
     queue_margin_s: float = Field(

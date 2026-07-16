@@ -6,11 +6,11 @@ from inference_perf.policies.retention import WorkflowAwarePolicy
 
 class TestWorkflowAwareProfile:
     def test_layered_directive_from_profile(self):
-        # TTL = intervening_spans*per_span_s + queue_margin_s + ttl_buffer_s
+        # TTL = cold_gap*per_span_s + queue_margin_s + ttl_buffer_s
         p = WorkflowAwarePolicy(ttl_buffer_s=3.0, per_span_s=9.0, queue_margin_s=10.0)
         out = p.compute_directives([
-            ReuseSegment(start=0, end=175, breadth=5, intervening_spans=4),
-            ReuseSegment(start=175, end=400, breadth=2, intervening_spans=3),
+            ReuseSegment(start=0, end=175, breadth=5, cold_gap=4),
+            ReuseSegment(start=175, end=400, breadth=2, cold_gap=3),
         ], scope="s1")
         dirs = out["retention_directives"]
         assert out["retention_scope"] == "s1"
@@ -28,10 +28,11 @@ class TestWorkflowAwareProfile:
         p = WorkflowAwarePolicy()
         assert p.compute_directives(None, scope="s1") is None
 
-    def test_breadth_one_is_leaf_priority(self):
+    def test_single_reuse_is_low_priority(self):
+        # breadth 1 (one future reuser) → low tier (50), regardless of cold_gap.
         p = WorkflowAwarePolicy()
         dirs = p.compute_directives(
-            [ReuseSegment(start=0, end=50, breadth=1)], scope="s1"
+            [ReuseSegment(start=0, end=50, breadth=1, cold_gap=4)], scope="s1"
         )["retention_directives"]
         assert dirs[0]["priority"] == 50
 
@@ -41,9 +42,9 @@ class TestWorkflowAwareProfile:
         p = WorkflowAwarePolicy(ttl_buffer_s=3.0, per_span_s=9.0, queue_margin_s=10.0)
         dirs = p.compute_directives(
             [
-                ReuseSegment(start=0, end=175, breadth=5, intervening_spans=4),
+                ReuseSegment(start=0, end=175, breadth=5, cold_gap=4),
                 ReuseSegment(
-                    start=175, end=175, breadth=1, intervening_spans=2,
+                    start=175, end=175, breadth=1, cold_gap=2,
                     covers_output=True,
                 ),
             ],
@@ -60,6 +61,13 @@ class TestWorkflowAwareProfile:
         assert dirs[1]["duration"] == 2 * 9.0 + 10.0 + 3.0
         # Output is the deepest region → non-increasing priority holds.
         assert dirs[0]["priority"] >= dirs[1]["priority"]
+
+    def test_priority_ignores_cold_gap(self):
+        # Priority is breadth-only; cold_gap changes the TTL, not the tier.
+        p = WorkflowAwarePolicy()
+        assert p._priority_for_breadth(2) == p._priority_for_breadth(2)
+        assert p._priority_for_breadth(4) > p._priority_for_breadth(2)
+        assert p._priority_for_breadth(2) > p._priority_for_breadth(1)
 
 
 class TestBuildFromConfig:
