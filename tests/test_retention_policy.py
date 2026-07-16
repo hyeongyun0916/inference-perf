@@ -35,6 +35,32 @@ class TestWorkflowAwareProfile:
         )["retention_directives"]
         assert dirs[0]["priority"] == 50
 
+    def test_covers_output_segment_emits_flag_directive(self):
+        # An output-covering segment emits a flag directive (no start/end) so
+        # the server protects the region it generates; priority/TTL still apply.
+        p = WorkflowAwarePolicy(ttl_buffer_s=3.0, per_span_s=9.0, queue_margin_s=10.0)
+        dirs = p.compute_directives(
+            [
+                ReuseSegment(start=0, end=175, breadth=5, intervening_spans=4),
+                ReuseSegment(
+                    start=175, end=175, breadth=1, intervening_spans=2,
+                    covers_output=True,
+                ),
+            ],
+            scope="s1",
+        )["retention_directives"]
+        # Prompt-prefix directive is ranged; the output directive is a flag.
+        assert dirs[0] == {
+            "start": 0, "end": 175, "priority": 90,
+            "duration": 4 * 9.0 + 10.0 + 3.0,
+        }
+        assert "start" not in dirs[1] and "end" not in dirs[1]
+        assert dirs[1]["covers_output"] is True
+        assert dirs[1]["priority"] == 50  # breadth 1 → leaf tier
+        assert dirs[1]["duration"] == 2 * 9.0 + 10.0 + 3.0
+        # Output is the deepest region → non-increasing priority holds.
+        assert dirs[0]["priority"] >= dirs[1]["priority"]
+
 
 class TestBuildFromConfig:
     def test_per_span_and_queue_margin_propagate(self):

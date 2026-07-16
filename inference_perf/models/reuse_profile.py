@@ -31,3 +31,4 @@ class ReuseSegment(BaseModel):
     end: int = Field(..., ge=0, description="Token end position (exclusive)")
     breadth: int = Field(..., ge=1, description="Number of future calls reusing up to `end`")
     intervening_spans: int = Field(default=0, ge=0, description="Calls running during the idle gap before the FARTHEST reuse of this region; TTL basis (real idle ~= intervening_spans * per-span latency)")
+    covers_output: bool = Field(default=False, description="Covers the producer's generated output; start/end are ignored and the server protects the post-prompt region it generates.")

@@ -106,41 +106,63 @@ def _compute_reuse_profiles(events) -> Dict[str, List[ReuseSegment]]:
 
     A consumer reuses only the LEADING contiguous run of shared/output segments
     (the first 'unique' segment breaks prefix-cache contiguity). breadth(t) =
-    #consumers reusing >= t tokens. Producers with no reuse are absent (terminal)."""
+    #consumers reusing >= t tokens. Producers with no reuse are absent (terminal).
+
+    Prompt-prefix reuse is credited into ranged segments; reuse reaching the
+    producer's generated OUTPUT becomes a separate covers_output flag segment
+    (the server resolves the exact post-prompt region)."""
     by_id = {e.event_id: e for e in events}
     all_starts = sorted(e.t_start_ms for e in events)
-    # pid -> [(reused_tokens, consumer_t_start_ms)]
-    consumers: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    # pid -> [(prompt_reused_tokens, consumer_t_start_ms, reuses_output)]
+    consumers: Dict[str, List[Tuple[int, int, bool]]] = defaultdict(list)
     for c in events:
-        reused_per_pred: Dict[str, int] = defaultdict(int)
+        prompt_per_pred: Dict[str, int] = defaultdict(int)
+        out_per_pred: Dict[str, bool] = defaultdict(bool)
         for seg in c.call.input_segments:
             if seg.type == "unique":
                 break  # prefix-cache contiguity ends at the consumer's first own/new content
-            if seg.source_event_id is not None:  # leading shared/output run
-                reused_per_pred[seg.source_event_id] += seg.token_count
-        for sid, toks in reused_per_pred.items():
-            if toks <= 0:
+            if seg.source_event_id is None:
                 continue
+            if seg.type == "output":  # leading run reached the producer's output
+                out_per_pred[seg.source_event_id] = True
+            else:  # shared/prompt content
+                prompt_per_pred[seg.source_event_id] += seg.token_count
+        for sid in set(prompt_per_pred) | set(out_per_pred):
             if by_id.get(sid) is None:
                 continue
-            consumers[sid].append((toks, c.t_start_ms))
+            toks = prompt_per_pred.get(sid, 0)
+            reuses_output = out_per_pred.get(sid, False)
+            if toks <= 0 and not reuses_output:
+                continue
+            consumers[sid].append((toks, c.t_start_ms, reuses_output))
     profiles: Dict[str, List[ReuseSegment]] = {}
     for sid, lst in consumers.items():
         prod_end = by_id[sid].t_end_ms
         prev = 0
-        segs = []
-        for b in sorted({t for t, _ in lst}):
-            covering = [(t, cs) for t, cs in lst if t >= b]
-            farthest_start = max(cs for _, cs in covering)
+        segs: List[ReuseSegment] = []
+        # Ranged segments for prompt-prefix reuse (breadth tiers by depth).
+        for b in sorted({t for t, _, _ in lst if t > 0}):
+            covering = [cs for t, cs, _ in lst if t >= b]
             # Spans running during the idle window (producer end -> farthest
             # reuse start); the policy turns this count into a TTL.
-            intervening = sum(1 for st in all_starts if prod_end < st < farthest_start)
+            intervening = sum(1 for st in all_starts if prod_end < st < max(covering))
             segs.append(ReuseSegment(
                 start=prev, end=b,
                 breadth=len(covering),
                 intervening_spans=intervening,
             ))
             prev = b
+        # One flag segment if any consumer reuses the producer's OUTPUT. No
+        # range: the server protects the post-prompt region it generates.
+        out_starts = [cs for _, cs, o in lst if o]
+        if out_starts:
+            intervening = sum(1 for st in all_starts if prod_end < st < max(out_starts))
+            segs.append(ReuseSegment(
+                start=prev, end=prev,
+                breadth=len(out_starts),
+                intervening_spans=intervening,
+                covers_output=True,
+            ))
         profiles[sid] = segs
     return profiles
 

@@ -66,16 +66,32 @@ class WorkflowAwarePolicy:
         # No profile → no directive (immediate LRU evict). Covers None and [].
         if not profile:
             return None
-        directives: list[dict[str, Any]] = [
-            {
-                "start": seg.start,
-                "end": seg.end,
-                "priority": self._priority_for_breadth(seg.breadth),
-                "duration": seg.intervening_spans * self.per_span_s
-                + self.queue_margin_s + self.ttl_buffer_s,
-            }
-            for seg in profile
-        ]
+        directives: list[dict[str, Any]] = []
+        for seg in profile:
+            duration = (
+                seg.intervening_spans * self.per_span_s
+                + self.queue_margin_s
+                + self.ttl_buffer_s
+            )
+            priority = self._priority_for_breadth(seg.breadth)
+            if seg.covers_output:
+                # Range-less: the server resolves the post-prompt region.
+                directives.append(
+                    {
+                        "covers_output": True,
+                        "priority": priority,
+                        "duration": duration,
+                    }
+                )
+            else:
+                directives.append(
+                    {
+                        "start": seg.start,
+                        "end": seg.end,
+                        "priority": priority,
+                        "duration": duration,
+                    }
+                )
         result: dict[str, Any] = {"retention_directives": directives}
         if scope is not None:
             result["retention_scope"] = scope

@@ -50,8 +50,25 @@ def test_only_leading_contiguous_prefix_is_credited():
     ], ["A", "B"])
     profiles = _compute_reuse_profiles([A, B, C])
     assert "A" in profiles
-    assert profiles["A"][0].end == 100  # 60 shared + 40 output (leading run)
+    # Prompt-prefix reuse (60 shared) is a ranged segment; the producer's
+    # output reuse (40) becomes a covers_output flag segment (no range).
+    assert profiles["A"][0].end == 60
+    assert profiles["A"][0].covers_output is False
+    assert profiles["A"][-1].covers_output is True
     assert "B" not in profiles          # injected after the unique break → not prefix-hittable
+
+
+def test_output_reuse_becomes_covers_output_flag():
+    # A producer whose OUTPUT is reused gets a covers_output flag segment with
+    # no range — the server protects the generated region, so the client sends
+    # intent (flag + priority/TTL), not coordinates it cannot know yet.
+    P = _ev("P", 0, 1000, [], [])
+    C = _ev("C", 5000, 7000, [_seg("P", 80, typ="output")], ["P"])
+    profiles = _compute_reuse_profiles([P, C])
+    assert len(profiles["P"]) == 1
+    seg = profiles["P"][0]
+    assert seg.covers_output is True
+    assert seg.breadth == 1
 
 
 def test_intervening_spans_counted():
