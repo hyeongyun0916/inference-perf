@@ -101,6 +101,38 @@ def _detect_bad_tool_calls(
 # --- end bad_tool_call_handling --------------------------------------------
 
 
+def _prefix_reuse_counts(events) -> Dict[str, int]:
+    """Per event: number of consecutive later events (time-ordered) that reuse
+    this event's full prompt as a leading shared/output prefix, stopping at the
+    first that does not. Matches the simulator's ``fwd_reuse`` (prefix-containment
+    forward count) so sim and ip gate on an identical signal."""
+    order = sorted(events, key=lambda e: float(getattr(e, "t_start_ms", 0) or 0))
+
+    def _lens(ev) -> Tuple[int, int]:
+        segs = getattr(ev.call, "input_segments", []) or []
+        total = sum(seg.token_count for seg in segs)
+        leading = 0
+        for seg in segs:
+            if seg.type == "unique":
+                break  # prefix-cache contiguity ends at the consumer's own content
+            leading += seg.token_count
+        return total, leading
+
+    lens = [_lens(e) for e in order]
+    out: Dict[str, int] = {}
+    for i, ev in enumerate(order):
+        prompt_len_i = lens[i][0]
+        cnt = 0
+        if prompt_len_i > 0:
+            for j in range(i + 1, len(order)):
+                if lens[j][1] >= prompt_len_i:  # event j reuses >= i's full prompt
+                    cnt += 1
+                else:
+                    break
+        out[ev.event_id] = cnt
+    return out
+
+
 def _compute_reuse_profiles(events) -> Dict[str, List[ReuseSegment]]:
     """Build each producer's reuse-depth profile from consumers' input_segments.
 
@@ -420,6 +452,9 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
     model_config = {"arbitrary_types_allowed": True}
 
     event_id: str
+    # Consecutive later events reusing this event's full prompt as a leading
+    # prefix (stops at the first non-reuser); feeds the remaining-reuse gate.
+    remaining_reuse: int = 0
     registry: EventOutputRegistry
     worker_tracker: WorkerSessionTracker
     completion_queue: Any
@@ -507,6 +542,7 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
         return self.retention_policy.compute_directives(
             reuse_depth_profile=profile,
             scope=self._extract_session_id(),
+            remaining_reuse=self.remaining_reuse,
         )
 
     async def _calibrate_profile_via_render(
@@ -1665,11 +1701,24 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
 
         retention_policy = getattr(self, "retention_policy", None)
 
+        remaining_reuse = 0
+        if state and raw_event_id in state.graph.events:
+            cache = getattr(self, "_reuse_count_cache", None)
+            if cache is None:
+                cache = {}
+                self._reuse_count_cache = cache
+            rc = cache.get(session_id)
+            if rc is None:
+                rc = _prefix_reuse_counts(list(state.graph.events.values()))
+                cache[session_id] = rc
+            remaining_reuse = rc.get(raw_event_id, 0)
+
         return SessionChatCompletionAPIData(
             messages=chat_messages,
             max_tokens=max_tokens,
             tool_definitions=event.tool_definitions,
             event_id=event.event_id,
+            remaining_reuse=remaining_reuse,
             registry=self.output_registry,
             worker_tracker=getattr(self, "worker_tracker", WorkerSessionTracker()),
             completion_queue=getattr(self, "session_completion_queue", None),

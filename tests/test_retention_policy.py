@@ -137,3 +137,52 @@ class TestDirectiveRescale:
         d = self._mk(actual_chars=4000, recorded_chars=4000)
         prof = [ReuseSegment(start=0, end=500, breadth=1, cold_gap=0)]
         assert d._rescale_profile_to_materialized(prof) is prof
+
+
+class TestMinBreadthFilter:
+    def test_below_threshold_emits_none(self):
+        p = WorkflowAwarePolicy(min_breadth=8)
+        out = p.compute_directives(
+            [ReuseSegment(start=0, end=100, breadth=3, cold_gap=1)], scope="s1"
+        )
+        assert out is None
+
+    def test_at_threshold_emits(self):
+        p = WorkflowAwarePolicy(min_breadth=8)
+        out = p.compute_directives(
+            [ReuseSegment(start=0, end=100, breadth=8, cold_gap=1)], scope="s1"
+        )
+        assert out is not None and len(out["retention_directives"]) == 1
+
+    def test_default_off(self):
+        p = WorkflowAwarePolicy()
+        out = p.compute_directives(
+            [ReuseSegment(start=0, end=100, breadth=1, cold_gap=1)], scope="s1"
+        )
+        assert out is not None
+
+
+class TestMinRemainingReuse:
+    def test_suppressed_below_threshold(self):
+        p = WorkflowAwarePolicy(min_remaining_reuse=8)
+        out = p.compute_directives(
+            [ReuseSegment(start=0, end=100, breadth=2, cold_gap=1)],
+            scope="s1", remaining_reuse=5,
+        )
+        assert out is None
+
+    def test_emitted_at_threshold(self):
+        p = WorkflowAwarePolicy(min_remaining_reuse=8)
+        out = p.compute_directives(
+            [ReuseSegment(start=0, end=100, breadth=2, cold_gap=1)],
+            scope="s1", remaining_reuse=8,
+        )
+        assert out is not None and out["retention_directives"][0]["start"] == 0
+
+    def test_off_when_zero(self):
+        p = WorkflowAwarePolicy(min_remaining_reuse=0)
+        out = p.compute_directives(
+            [ReuseSegment(start=0, end=100, breadth=2, cold_gap=1)],
+            scope="s1", remaining_reuse=0,
+        )
+        assert out is not None

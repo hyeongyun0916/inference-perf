@@ -284,6 +284,17 @@ class RetentionPolicyConfig(BaseModel):
         ge=0,
         description="Queue-wait margin added to each per-segment idle-gap TTL.",
     )
+    min_remaining_reuse: int = Field(
+        default=0,
+        ge=0,
+        description="Reuse gate: skip directive if this prompt is reused fewer "
+        "than N more times downstream (0=off). Matches simulator fwd_reuse.",
+    )
+    min_breadth: int = Field(
+        default=0,
+        ge=0,
+        description="Skip directives when max reuse breadth is below this (0=off).",
+    )
     render_url: Optional[str] = Field(
         default=None,
         description="Base URL of a vLLM server exposing /v1/chat/completions/"
