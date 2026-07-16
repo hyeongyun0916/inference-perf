@@ -284,3 +284,10 @@ class RetentionPolicyConfig(BaseModel):
         ge=0,
         description="Queue-wait margin added to each per-segment idle-gap TTL.",
     )
+    render_url: Optional[str] = Field(
+        default=None,
+        description="Base URL of a vLLM server exposing /v1/chat/completions/"
+        "render. When set, directive boundaries are calibrated to exact "
+        "materialized token coordinates via render+LCP (fallback: char-ratio "
+        "rescale).",
+    )

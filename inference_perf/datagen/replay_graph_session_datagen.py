@@ -113,10 +113,15 @@ def _compute_reuse_profiles(events) -> Dict[str, List[ReuseSegment]]:
     (the server resolves the exact post-prompt region)."""
     by_id = {e.event_id: e for e in events}
     all_starts = sorted(e.t_start_ms for e in events)
-    # pid -> [(prompt_reused_tokens, consumer_t_start_ms, reuses_output)]
-    consumers: Dict[str, List[Tuple[int, int, bool]]] = defaultdict(list)
+    # pid -> [(prompt_reused_tokens, consumer_t_start_ms, msgs, reuses_output)]
+    # msgs = producer messages covered by the consumer's leading shared run —
+    # anchors each ranged boundary structurally for exact render calibration.
+    # reuses_output = the run also reaches the producer's generated output
+    # (emitted as a separate covers_output flag segment, no range).
+    consumers: Dict[str, List[Tuple[int, int, int, bool]]] = defaultdict(list)
     for c in events:
         prompt_per_pred: Dict[str, int] = defaultdict(int)
+        msgs_per_pred: Dict[str, int] = defaultdict(int)
         out_per_pred: Dict[str, bool] = defaultdict(bool)
         for seg in c.call.input_segments:
             if seg.type == "unique":
@@ -127,6 +132,7 @@ def _compute_reuse_profiles(events) -> Dict[str, List[ReuseSegment]]:
                 out_per_pred[seg.source_event_id] = True
             else:  # shared/prompt content
                 prompt_per_pred[seg.source_event_id] += seg.token_count
+                msgs_per_pred[seg.source_event_id] += seg.message_count
         for sid in set(prompt_per_pred) | set(out_per_pred):
             if by_id.get(sid) is None:
                 continue
@@ -134,15 +140,19 @@ def _compute_reuse_profiles(events) -> Dict[str, List[ReuseSegment]]:
             reuses_output = out_per_pred.get(sid, False)
             if toks <= 0 and not reuses_output:
                 continue
-            consumers[sid].append((toks, c.t_start_ms, reuses_output))
+            consumers[sid].append(
+                (toks, c.t_start_ms, msgs_per_pred.get(sid, 0), reuses_output)
+            )
     profiles: Dict[str, List[ReuseSegment]] = {}
     for sid, lst in consumers.items():
         prod_end = by_id[sid].t_end_ms
         prev = 0
         segs: List[ReuseSegment] = []
+        # boundary -> message-count anchor for render calibration
+        anchor = {t: m for t, _, m, _ in lst if t > 0}
         # Ranged segments for prompt-prefix reuse (breadth tiers by depth).
-        for b in sorted({t for t, _, _ in lst if t > 0}):
-            covering = [cs for t, cs, _ in lst if t >= b]
+        for b in sorted({t for t, _, _, _ in lst if t > 0}):
+            covering = [cs for t, cs, _, _ in lst if t >= b]
             # Longest untouched run between consecutive uses: recency-hot ->
             # ~0, a genuine set-aside -> large (gap-to-farthest would conflate
             # the two and over-retain hot regions).
@@ -156,11 +166,12 @@ def _compute_reuse_profiles(events) -> Dict[str, List[ReuseSegment]]:
                 start=prev, end=b,
                 breadth=len(covering),
                 cold_gap=cold_gap,
+                end_msg=anchor.get(b),
             ))
             prev = b
         # One flag segment if any consumer reuses the producer's OUTPUT. No
         # range: the server protects the post-prompt region it generates.
-        out_starts = [cs for _, cs, o in lst if o]
+        out_starts = [cs for _, cs, _, o in lst if o]
         if out_starts:
             marks = sorted([prod_end] + out_starts)
             cold_gap = max(
@@ -347,6 +358,62 @@ class EventOutputRegistry:
         return output
 
 
+# ---------------------------------------------------------------------------
+# Render-based exact coordinate calibration (client-side helper).
+# The serving vLLM exposes /v1/chat/completions/render returning the exact
+# token_ids it would compute for a payload. Prefix renders are cached by
+# content hash: a session's past messages are immutable once substituted, so
+# the same anchor repeats across all its later turns.
+_render_semaphore = asyncio.Semaphore(8)
+_render_cache: Dict[str, List[int]] = {}
+_render_session = None  # lazy aiohttp.ClientSession
+
+
+def _lcp_len(a: List[int], b: List[int]) -> int:
+    """Length of the longest common prefix of two token-id lists."""
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
+
+
+async def _render_token_ids(
+    render_url: str, body: Dict[str, Any], cacheable: bool = False
+) -> Optional[List[int]]:
+    """POST body to <render_url>/v1/chat/completions/render → token_ids."""
+    global _render_session
+    import hashlib
+
+    key = None
+    if cacheable:
+        key = hashlib.md5(
+            json.dumps(body, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        cached = _render_cache.get(key)
+        if cached is not None:
+            return cached
+    if _render_session is None:
+        import aiohttp
+        _render_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=120),
+            connector=aiohttp.TCPConnector(force_close=True),
+        )
+    async with _render_semaphore:
+        async with _render_session.post(
+            render_url.rstrip("/") + "/v1/chat/completions/render", json=body
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"render HTTP {resp.status}: {(await resp.text())[:200]}")
+            data = await resp.json()
+    ids = data.get("token_ids") or (data.get("prompt_token_ids"))
+    if not isinstance(ids, list):
+        raise RuntimeError(f"render response missing token_ids: {list(data)[:8]}")
+    if key is not None:
+        _render_cache[key] = ids
+    return ids
+
+
 class SessionChatCompletionAPIData(ChatCompletionAPIData):
     """ChatCompletionAPIData subclass for graph-backed session replay."""
 
@@ -430,11 +497,141 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
 
     def _compute_retention_extra_body(self) -> Optional[Dict[str, Any]]:
         """Invoke the retention policy with this event's reuse-depth profile to
-        build the extra_body retention_directives (None if no profile)."""
+        build the extra_body retention_directives (None if no profile).
+
+        The profile is computed in RECORDED-trace token coordinates; rescale it
+        into the materialized request's token space before deriving directives
+        (see _rescale_profile_to_materialized). _calibrate_profile_via_render is
+        the exact render-based alternative when a render endpoint is available."""
+        profile = self._rescale_profile_to_materialized(self.reuse_depth_profile)
         return self.retention_policy.compute_directives(
-            reuse_depth_profile=self.reuse_depth_profile,
+            reuse_depth_profile=profile,
             scope=self._extract_session_id(),
         )
+
+    async def _calibrate_profile_via_render(
+        self, payload: Dict[str, Any]
+    ) -> Optional[List[ReuseSegment]]:
+        """Resolve profile boundaries to exact materialized-token coordinates
+        via the server's /render endpoint: render each end_msg anchor's message
+        prefix and take its longest common prefix with the full render.
+        covers_output flag segments pass through (no coordinates needed).
+        Returns None on failure (caller falls back to char-ratio rescale);
+        prefix renders are cached (past messages are immutable per session).
+        """
+        profile = self.reuse_depth_profile
+        if not profile:
+            return None
+        if not any(seg.end_msg is not None or seg.covers_output for seg in profile):
+            return None  # unanchored legacy profile
+        try:
+            base_body: Dict[str, Any] = {
+                "model": payload.get("model"),
+                "messages": payload.get("messages") or [],
+                "max_tokens": 1,
+            }
+            if payload.get("tools"):
+                base_body["tools"] = payload["tools"]
+            full_ids = await _render_token_ids(
+                self.retention_policy.render_url, base_body
+            )
+            if not full_ids:
+                return None
+            prompt_len = len(full_ids)
+            messages = base_body["messages"]
+
+            # Resolve each distinct message-anchor once.
+            anchors: Dict[int, int] = {}
+            for seg in profile:
+                m = seg.end_msg
+                if seg.covers_output or m is None or m in anchors:
+                    continue
+                if m <= 0:
+                    anchors[m] = 0
+                    continue
+                if m >= len(messages):
+                    anchors[m] = prompt_len
+                    continue
+                prefix_body = dict(base_body)
+                prefix_body["messages"] = messages[:m]
+                prefix_ids = await _render_token_ids(
+                    self.retention_policy.render_url, prefix_body, cacheable=True
+                )
+                if prefix_ids is None:
+                    return None
+                anchors[m] = _lcp_len(prefix_ids, full_ids)
+
+            calibrated: List[ReuseSegment] = []
+            prev = 0
+            for seg in profile:
+                if seg.covers_output:
+                    # Flag segment: the policy emits a range-less covers_output
+                    # directive and the SERVER resolves the exact post-prompt
+                    # region it generates — no coordinate calibration needed.
+                    calibrated.append(seg)
+                    continue
+                new_end = anchors.get(seg.end_msg, seg.end)  # type: ignore[arg-type]
+                new_end = max(new_end, prev)  # keep monotone
+                calibrated.append(ReuseSegment(
+                    start=prev, end=new_end,
+                    breadth=seg.breadth, cold_gap=seg.cold_gap,
+                    end_msg=seg.end_msg,
+                ))
+                prev = new_end
+            logger.debug(
+                "Event %s: render-calibrated %d segment(s), prompt_len=%d",
+                self.event_id, len(calibrated), prompt_len,
+            )
+            return calibrated
+        except Exception as e:
+            logger.warning(
+                "Event %s: render calibration failed (%s: %s); falling back to rescale",
+                self.event_id, type(e).__name__, e,
+            )
+            return None
+
+    def _rescale_profile_to_materialized(
+        self, profile: Optional[List[ReuseSegment]]
+    ) -> Optional[List[ReuseSegment]]:
+        """Best-effort mapping from recorded-trace token coordinates into the
+        materialized request's token space: scale by the materialized/recorded
+        content-size ratio (same estimator both sides, so its bias cancels) and
+        shift by the tool-definitions preamble. Recorded coordinates can be off
+        ~2x on tool-heavy traces (live substitution, template, tokenizer)."""
+        if not profile:
+            return profile
+
+        def _content(m: Any) -> str:
+            c = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+            return c if isinstance(c, str) else ""
+
+        from inference_perf.datagen.otel_trace_to_replay_graph import estimate_tokens
+
+        recorded = sum(estimate_tokens(_content(m)) for m in (self.original_messages or []))
+        actual = sum(estimate_tokens(_content(m)) for m in (self.messages or []))
+        if recorded <= 0 or actual <= 0:
+            return profile
+        scale = actual / recorded
+        offset = 0
+        if self.tool_definitions:
+            try:
+                offset = estimate_tokens(json.dumps(self.tool_definitions))
+            except (TypeError, ValueError):
+                offset = 0
+        if abs(scale - 1.0) < 0.02 and offset == 0:
+            return profile
+        return [
+            # Flag segments pass through: their coords are ignored (the
+            # server resolves the post-prompt region from the flag).
+            seg if seg.covers_output else ReuseSegment(
+                start=offset + int(seg.start * scale),
+                end=offset + int(seg.end * scale),
+                breadth=seg.breadth,
+                cold_gap=seg.cold_gap,
+                end_msg=seg.end_msg,
+            )
+            for seg in profile
+        ]
 
     def _extract_session_id(self) -> str:
         return self.event_id.split(":")[0] if ":" in self.event_id else self.event_id

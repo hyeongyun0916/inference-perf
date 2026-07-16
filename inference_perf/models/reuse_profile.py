@@ -14,6 +14,8 @@
 
 """Reuse-depth profile model for workflow-aware KV-cache retention."""
 
+from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -32,4 +34,8 @@ class ReuseSegment(BaseModel):
     end: int = Field(..., ge=0, description="Token end position (exclusive)")
     breadth: int = Field(..., ge=1, description="Number of future calls reusing up to `end`")
     cold_gap: int = Field(default=0, ge=0, description="Max consecutive intervening calls this region goes untouched between reuses; TTL basis (a recency-hot region has cold_gap ~= 0 and needs no retention)")
+    # start/end are RECORDED-token estimates; end_msg structurally anchors
+    # `end` (producer message count) so render calibration can resolve it to
+    # exact materialized-token coordinates.
+    end_msg: Optional[int] = Field(default=None, ge=0, description="Producer message count that `end` corresponds to (None = unanchored)")
     covers_output: bool = Field(default=False, description="Covers the producer's generated output; start/end are ignored and the server protects the post-prompt region it generates.")

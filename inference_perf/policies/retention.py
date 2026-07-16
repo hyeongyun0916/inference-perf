@@ -50,6 +50,7 @@ class WorkflowAwarePolicy:
         low_breadth_priority: int = 50,
         per_span_s: float = 9.0,
         queue_margin_s: float = 10.0,
+        render_url: str | None = None,
     ) -> None:
         self.ttl_buffer_s = ttl_buffer_s
         self.high_breadth_priority = high_breadth_priority
@@ -57,6 +58,11 @@ class WorkflowAwarePolicy:
         self.low_breadth_priority = low_breadth_priority
         self.per_span_s = per_span_s
         self.queue_margin_s = queue_margin_s
+        # Exact-coordinate calibration: base URL of a vLLM server exposing
+        # /v1/chat/completions/render. When set, the datagen resolves each
+        # directive boundary to exact materialized token positions before
+        # compute_directives is called (None = legacy char-ratio rescale).
+        self.render_url = render_url
 
     def compute_directives(
         self,

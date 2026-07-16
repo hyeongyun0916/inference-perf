@@ -96,3 +96,44 @@ class TestBuildFromConfig:
         assert p.per_span_s == 9.0
         assert p.queue_margin_s == 10.0
         assert p.ttl_buffer_s == 5.0
+
+
+class TestDirectiveRescale:
+    def _mk(self, actual_chars, recorded_chars, tools=None):
+        from inference_perf.datagen.replay_graph_session_datagen import (
+            EventOutputRegistry,
+            SessionChatCompletionAPIData,
+            WorkerSessionTracker,
+        )
+        from inference_perf.apis.chat import ChatMessage
+        return SessionChatCompletionAPIData(
+            event_id="s:e",
+            registry=EventOutputRegistry(),
+            worker_tracker=WorkerSessionTracker(),
+            completion_queue=None,
+            total_events_in_session=1,
+            messages=[ChatMessage(role="user", content="x" * actual_chars)],
+            original_messages=[{"role": "user", "content": "x" * recorded_chars}],
+            tool_definitions=tools,
+        )
+
+    def test_boundaries_scale_to_materialized_size(self):
+        # recorded est 1000 tok, materialized est 2000 tok -> boundaries double.
+        d = self._mk(actual_chars=8000, recorded_chars=4000)
+        out = d._rescale_profile_to_materialized(
+            [ReuseSegment(start=0, end=500, breadth=2, cold_gap=1)]
+        )
+        assert (out[0].start, out[0].end) == (0, 1000)
+
+    def test_tools_preamble_shifts_ranges(self):
+        tools = [{"name": "t", "description": "d" * 400}]
+        d = self._mk(actual_chars=4000, recorded_chars=4000, tools=tools)
+        out = d._rescale_profile_to_materialized(
+            [ReuseSegment(start=0, end=500, breadth=1, cold_gap=0)]
+        )
+        assert out[0].start > 0 and out[0].end > 500  # shifted by tools estimate
+
+    def test_noop_when_sizes_match_and_no_tools(self):
+        d = self._mk(actual_chars=4000, recorded_chars=4000)
+        prof = [ReuseSegment(start=0, end=500, breadth=1, cold_gap=0)]
+        assert d._rescale_profile_to_materialized(prof) is prof
