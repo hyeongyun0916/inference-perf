@@ -28,6 +28,7 @@ import logging
 import re
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field, replace as dc_replace
 from multiprocessing.managers import SyncManager
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -50,6 +51,7 @@ from inference_perf.config import APIConfig, APIType, DataConfig, SessionReplayC
 from inference_perf.config.datagen.replay import BadToolCallHandling
 from inference_perf.datagen.base import LazyLoadDataMixin, SessionGenerator
 from inference_perf.datagen.replay_graph_types import InputSegment, ReplayGraph
+from inference_perf.models import ReuseSegment
 from inference_perf.utils.custom_tokenizer import CustomTokenizer
 
 logger = logging.getLogger(__name__)
@@ -111,6 +113,287 @@ def _detect_bad_tool_calls(
 
 
 # --- end bad_tool_call_handling --------------------------------------------
+def _prefix_reuse_counts(events) -> Dict[str, int]:
+    """Per event: number of consecutive later events (time-ordered) that reuse
+    this event's full prompt as a leading shared/output prefix, stopping at the
+    first that does not. Matches the simulator's ``fwd_reuse`` (prefix-containment
+    forward count) so sim and ip gate on an identical signal."""
+    order = sorted(events, key=lambda e: float(getattr(e, "t_start_ms", 0) or 0))
+
+    def _lens(ev) -> Tuple[int, int]:
+        segs = getattr(ev.call, "input_segments", []) or []
+        total = sum(seg.token_count for seg in segs)
+        leading = 0
+        for seg in segs:
+            if seg.type == "unique":
+                break  # prefix-cache contiguity ends at the consumer's own content
+            leading += seg.token_count
+        return total, leading
+
+    lens = [_lens(e) for e in order]
+    out: Dict[str, int] = {}
+    for i, ev in enumerate(order):
+        prompt_len_i = lens[i][0]
+        cnt = 0
+        if prompt_len_i > 0:
+            for j in range(i + 1, len(order)):
+                if lens[j][1] >= prompt_len_i:  # event j reuses >= i's full prompt
+                    cnt += 1
+                else:
+                    break
+        out[ev.event_id] = cnt
+    return out
+
+
+def _live_msgs(ev, registry):
+    """ev's messages with RECORDED assistant outputs replaced by LIVE outputs
+    from the registry, so forward-reuse depth reflects what is actually shared
+    at serve time (the server caches the live conversation, not the trace).
+    Falls back to the recorded message when a live output isn't available yet
+    (future/own turns)."""
+    msgs = ev.call.messages
+    if registry is None:
+        return msgs
+    segs = getattr(ev.call, "input_segments", None)
+    if not segs:
+        return msgs
+    out_msgs = []
+    cursor = 0
+    for seg in segs:
+        seg_msgs = msgs[cursor:cursor + seg.message_count]
+        sid = getattr(seg, "source_event_id", None)
+        if getattr(seg, "type", None) == "output" and seg.message_count == 1 and sid:
+            live = registry.get_message_by_event_id(sid)
+            if live is not None:
+                out_msgs.append(live)
+            else:
+                txt = registry.get_output_by_event_id(sid)
+                if txt is not None and seg_msgs:
+                    m = dict(seg_msgs[0])
+                    m["content"] = txt
+                    out_msgs.append(m)
+                else:
+                    out_msgs.extend(seg_msgs)
+        else:
+            out_msgs.extend(seg_msgs)
+        cursor += seg.message_count
+    if cursor < len(msgs):
+        out_msgs.extend(msgs[cursor:])
+    return out_msgs
+
+
+def _forward_reuse_depths(
+    events, registry=None, target=None, completed_ids=None, dispatched_ids=None
+) -> Dict[str, Tuple[tuple, bool]]:
+    """Per event, the reuse-depth PROFILE + covers_output, TOKEN-granular.
+
+    Compares recorded message content directly (segment source_event_id
+    attribution under-detects). Comparison set is every non-ancestor turn,
+    split by lifecycle: COMPLETED turns are skipped (they won't reuse anything
+    again). FUTURE turns count toward BREADTH (priority tier + TTL) and
+    coverage. IN-FLIGHT turns (dispatched but not completed) hold COVERAGE
+    only: a depth reused solely by in-flight turns is emitted at a FLOOR
+    breadth of 1 (low priority tier, minimal TTL) so a same-scope turn cannot
+    owner-clear a block an in-flight (e.g. preempted, re-prefilling) turn will
+    hit again, without inflating the tier — breadth stays genuine future reuse
+    while coverage tracks anything still in use.
+
+    Returns (segments, covers_output): segments is a tuple of (shared_msgs,
+    partial_chars, breadth) ascending by depth.
+      - shared_msgs / partial_chars: a depth boundary — whole leading messages
+        plus a char-prefix of the first diverging message.
+      - breadth: how many comparison turns reuse this event's prompt AT LEAST
+        that deep. Shallower prefixes have higher breadth, hence higher tier.
+      - covers_output: a LATER event reuses this event's FULL prompt and
+        extends past it, so this event's output is reused too (backward
+        siblings never set this — an earlier turn can't consume this output).
+
+    Reuse is prefix-contiguous, so [messages[:shared_msgs] + first
+    partial_chars of the next message] is exactly a reused prefix; the client
+    renders each boundary and LCPs it against the full render to get the exact
+    TOKEN depth."""
+    order = sorted(events, key=lambda e: float(getattr(e, "t_start_ms", 0) or 0))
+
+    def _txt(m: Dict[str, Any]) -> str:
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        return json.dumps(c, sort_keys=True, default=str) if c is not None else ""
+
+    def _key(m: Dict[str, Any]) -> tuple:
+        tc = m.get("tool_calls")
+        return (m.get("role"), _txt(m), json.dumps(tc, sort_keys=True, default=str) if tc else "")
+
+    msgs = [_live_msgs(ev, registry) for ev in order]
+    keys = [[_key(m) for m in ms] for ms in msgs]
+
+    def _boundary(i: int, j: int) -> Tuple[int, int]:
+        a, ka, na = msgs[i], keys[i], len(msgs[i])
+        b, kb = msgs[j], keys[j]
+        w = 0
+        for x, y in zip(ka, kb, strict=False):
+            if x == y:
+                w += 1
+            else:
+                break
+        p = 0
+        if w < na and w < len(b) and a[w].get("role") == b[w].get("role"):
+            ca, cb = _txt(a[w]), _txt(b[w])
+            lim = min(len(ca), len(cb))
+            while p < lim and ca[p] == cb[p]:
+                p += 1
+        return w, p
+
+    # Comparison set = every NON-ANCESTOR turn (forward turns + backward
+    # cross-branch turns), excluding only this turn's own lineage. Ancestors are
+    # upstream and share only a shallow prefix; cross-branch cousins can share a
+    # deep prefix the causal graph does not link, and leaving that uncovered lets
+    # a same-scope turn owner-clear the owner's protection.
+    _eid2idx = {getattr(ev, "event_id", None): j for j, ev in enumerate(order)}
+    _idx_preds = [
+        [_eid2idx[p] for p in (getattr(ev, "predecessor_event_ids", ()) or ()) if p in _eid2idx]
+        for ev in order
+    ]
+
+    def _ancestors(i: int) -> set:
+        seen: set = set()
+        stack = list(_idx_preds[i])
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            stack.extend(_idx_preds[x])
+        return seen
+
+    out: Dict[str, Tuple[tuple, bool]] = {}
+    completed = completed_ids or frozenset()
+    for i, ev in enumerate(order):
+        if target is not None and ev.event_id != target:
+            continue
+        na = len(msgs[i])
+        depths_future: List[Tuple[int, int]] = []
+        depths_inflight: List[Tuple[int, int]] = []
+        covers = False
+        anc = _ancestors(i)
+        for j in range(len(order)):  # all non-ancestor turns
+            if j == i or j in anc:
+                continue
+            eid = getattr(order[j], "event_id", None)
+            if eid in completed:  # completed: neither breadth nor coverage
+                continue
+            is_future = dispatched_ids is None or eid not in dispatched_ids
+            w, p = _boundary(i, j)
+            if w > 0 or p > 0:
+                (depths_future if is_future else depths_inflight).append((w, p))
+            # covers_output: a FUTURE, later turn reuses this full prompt+output.
+            if is_future and j > i and w >= na and len(msgs[j]) > na:
+                covers = True
+        # future_breadth per boundary; depths reused only by in-flight turns get
+        # a floor breadth of 1. Boundaries ascending -> breadth non-increasing
+        # (future_breadth is monotone; floors sit only where future_breadth==0,
+        # necessarily at or beyond the deepest future boundary).
+        segs_list: List[Tuple[int, int, int]] = []
+        for (bw, bp) in sorted(set(depths_future) | set(depths_inflight)):
+            fb = sum(1 for d in depths_future if d >= (bw, bp))
+            if fb >= 1:
+                segs_list.append((bw, bp, fb))
+            elif any(d >= (bw, bp) for d in depths_inflight):
+                segs_list.append((bw, bp, 1))  # floor: coverage only, low tier
+        out[ev.event_id] = (tuple(segs_list), covers)
+    return out
+
+
+def _lifecycle_sets(graph_events, session_id, registry, dispatched_events) -> Tuple[frozenset, frozenset]:
+    """Split a session's turns into (completed_ids, dispatched_ids) raw-id sets.
+
+    The output registry is keyed by qualified id ("session:raw"); completed =
+    an event whose output is recorded. dispatched_events is the per-session set
+    of turns already sent; it is copied so the caller can add the current turn
+    afterwards without mutating the returned snapshot.
+
+    Args:
+        graph_events: mapping of raw event_id -> graph node (keys used).
+        session_id: this session's id (registry prefix).
+        registry: EventOutputRegistry or None.
+        dispatched_events: set of raw event_ids already dispatched.
+
+    Returns:
+        (completed_ids, dispatched_ids) as raw-id frozensets.
+    """
+    if registry is None:
+        completed = frozenset()
+    else:
+        recorded = set(registry.get_event_ids())  # qualified ids
+        completed = frozenset(
+            rid for rid in graph_events if f"{session_id}:{rid}" in recorded
+        )
+    return completed, frozenset(dispatched_events)
+
+
+def _compute_reuse_profiles(events) -> Dict[str, List[ReuseSegment]]:
+    """Build each producer's reuse-depth profile from consumers' input_segments.
+
+    A consumer reuses only the LEADING contiguous run of shared/output segments
+    (the first 'unique' segment breaks prefix-cache contiguity). breadth(t) =
+    #consumers reusing >= t tokens. Producers with no reuse are absent (terminal)."""
+    by_id = {e.event_id: e for e in events}
+    all_starts = sorted(e.t_start_ms for e in events)
+    # pid -> [(reused_tokens, consumer_t_start_ms, msgs, covers_output)]
+    # msgs = producer messages covered by the consumer's leading shared run;
+    # covers_output = the run also includes the producer's generated output.
+    # These anchor each boundary structurally for exact render calibration.
+    consumers: Dict[str, List[Tuple[int, int, int, bool]]] = defaultdict(list)
+    for c in events:
+        reused_per_pred: Dict[str, int] = defaultdict(int)
+        msgs_per_pred: Dict[str, int] = defaultdict(int)
+        out_per_pred: Dict[str, bool] = defaultdict(bool)
+        for seg in c.call.input_segments:
+            if seg.type == "unique":
+                break  # prefix-cache contiguity ends at the consumer's first own/new content
+            if seg.source_event_id is not None:  # leading shared/output run
+                reused_per_pred[seg.source_event_id] += seg.token_count
+                if seg.type == "output":
+                    out_per_pred[seg.source_event_id] = True
+                else:
+                    msgs_per_pred[seg.source_event_id] += seg.message_count
+        for sid, toks in reused_per_pred.items():
+            if toks <= 0:
+                continue
+            if by_id.get(sid) is None:
+                continue
+            consumers[sid].append(
+                (toks, c.t_start_ms, msgs_per_pred[sid], out_per_pred[sid])
+            )
+    profiles: Dict[str, List[ReuseSegment]] = {}
+    for sid, lst in consumers.items():
+        prod_end = by_id[sid].t_end_ms
+        prev = 0
+        segs = []
+        anchor = {t: (m, o) for t, _, m, o in lst}  # boundary -> structural anchor
+        for b in sorted({t for t, _, _, _ in lst}):
+            covering = [(t, cs) for t, cs, _, _ in lst if t >= b]
+            # Longest untouched gap in this region between consecutive uses
+            # (producer end, then each covering reuse start). Frequent reuse ->
+            # small cold_gap; a genuine set-aside -> large; the policy turns
+            # this into a TTL. (gap-to-FARTHEST-reuse would conflate the two.)
+            marks = sorted([prod_end] + [cs for _, cs in covering])
+            cold_gap = max(
+                (sum(1 for st in all_starts if marks[i] < st < marks[i + 1])
+                 for i in range(len(marks) - 1)),
+                default=0,
+            )
+            end_msg, covers_output = anchor[b]
+            segs.append(ReuseSegment(
+                start=prev, end=b,
+                breadth=len(covering),
+                cold_gap=cold_gap,
+                end_msg=end_msg,
+                covers_output=covers_output,
+            ))
+            prev = b
+        profiles[sid] = segs
+    return profiles
 
 
 class EventFailedError(Exception):
@@ -306,12 +589,73 @@ class EventOutputRegistry:
         return output
 
 
+# ---------------------------------------------------------------------------
+# Render-based exact coordinate calibration (client-side helper): the serving
+# vLLM's /v1/chat/completions/render endpoint returns the exact token_ids for
+# a payload. Prefix renders are cached by content hash (see _render_token_ids).
+_render_semaphore = asyncio.Semaphore(8)
+_render_cache: Dict[str, List[int]] = {}
+_render_session = None  # lazy aiohttp.ClientSession
+
+
+def _lcp_len(a: List[int], b: List[int]) -> int:
+    """Length of the longest common prefix of two token-id lists."""
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
+
+
+async def _render_token_ids(
+    render_url: str, body: Dict[str, Any], cacheable: bool = False
+) -> Optional[List[int]]:
+    """POST body to <render_url>/v1/chat/completions/render → token_ids."""
+    global _render_session
+    import hashlib
+
+    key = None
+    if cacheable:
+        key = hashlib.md5(
+            json.dumps(body, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        cached = _render_cache.get(key)
+        if cached is not None:
+            return cached
+    if _render_session is None:
+        import aiohttp
+        _render_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=120),
+            connector=aiohttp.TCPConnector(force_close=True),
+        )
+    async with _render_semaphore:
+        async with _render_session.post(
+            render_url.rstrip("/") + "/v1/chat/completions/render", json=body
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"render HTTP {resp.status}: {(await resp.text())[:200]}")
+            data = await resp.json()
+    ids = data.get("token_ids") or (data.get("prompt_token_ids"))
+    if not isinstance(ids, list):
+        raise RuntimeError(f"render response missing token_ids: {list(data)[:8]}")
+    if key is not None:
+        _render_cache[key] = ids
+    return ids
+
+
 class SessionChatCompletionAPIData(ChatCompletionAPIData):
     """ChatCompletionAPIData subclass for graph-backed session replay."""
 
     model_config = {"arbitrary_types_allowed": True}
 
     event_id: str
+    # 이 이벤트의 전체 프롬프트를 leading prefix로 재사용하는 이후 연속 이벤트 수
+    # (첫 미포함에서 중단). = 시뮬레이터 fwd_reuse. 정책의 잔여재사용 게이트용.
+    remaining_reuse: int = 0
+    # Forward per-depth reuse profile of this event's prompt; see
+    # _forward_reuse_depths for the (shared_msgs, partial_chars, breadth) shape.
+    forward_segments: tuple = ()
+    forward_covers_output: bool = False
     registry: EventOutputRegistry
     worker_tracker: WorkerSessionTracker
     completion_queue: Any
@@ -344,6 +688,10 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
     # early (e.g. recorded fallback also malformed). Lets the caller pass the
     # right reason string to _fail_and_notify instead of a generic fallback.
     _substitution_failure_reason: Optional[str] = None
+    # KV-cache retention policy (WorkflowAwarePolicy) for directive injection
+    retention_policy: Any = None
+    # Per-producer reuse-depth profile. None = not reused → no directive (EVICT).
+    reuse_depth_profile: Optional[List[ReuseSegment]] = None
 
     async def to_request_body(
         self, effective_model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool
@@ -365,14 +713,12 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                     f"overwriting with replay-enforced value."
                 )
             names = self.expected_output_tool_names or []
-            # Build available set from self.tool_definitions (the raw list). The name
-            # field is set explicitly in to_request_body and is NOT passed through
+            # name is set explicitly in to_request_body and NOT passed through
             # _clean_parameters, so it survives schema cleaning unchanged.
             available = {t["name"] for t in self.tool_definitions if "name" in t}
             if len(names) == 1 and names[0] in available:
-                # Force the exact function the original trace recorded. This maximises
-                # faithfulness to the trace and ensures the successor's role:tool messages
-                # (which reference this function by name/index) remain coherent.
+                # Force the exact function the trace recorded, so the successor's
+                # role:tool messages (referencing it by name/index) stay coherent.
                 payload["tool_choice"] = {"type": "function", "function": {"name": names[0]}}
             else:
                 # Fall back to "required" when:
@@ -382,7 +728,280 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                 # - there were multiple tool calls (vLLM only accepts one name at a time).
                 payload["tool_choice"] = "required"
 
+        if self.retention_policy is not None:
+            extra = await self._compute_retention_extra_body(payload)
+            if extra:
+                existing_extra = payload.get("extra_body") or {}
+                existing_extra.update(extra)
+                payload["extra_body"] = existing_extra
+
         return payload
+
+    async def _compute_retention_extra_body(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Build the extra_body retention_directives for this request.
+
+        Primary path (render_url set): forward-increment protection via render
+        + LCP (see _forward_reuse_directives) — bypasses the message-DAG
+        producer profile, which under-credits reuse (empty profile -> no
+        directive -> falls to LRU).
+
+        Fallback (no render_url, or render failure): legacy profile path —
+        char-ratio rescale of the producer reuse-depth profile.
+        """
+        if getattr(self.retention_policy, "render_url", None):
+            directives = await self._forward_reuse_directives(payload)
+            if directives is not None:
+                if not directives:
+                    return None  # request reuses nothing → no directive (LRU)
+                result: dict[str, Any] = {"retention_directives": directives}
+                scope = self._extract_session_id()
+                if scope is not None:
+                    result["retention_scope"] = scope
+                return result
+            # directives is None → render failed; fall through to legacy path.
+        profile = self._rescale_profile_to_materialized(self.reuse_depth_profile)
+        return self.retention_policy.compute_directives(
+            reuse_depth_profile=profile,
+            scope=self._extract_session_id(),
+            remaining_reuse=self.remaining_reuse,
+        )
+
+    async def _forward_reuse_directives(
+        self, payload: Dict[str, Any]
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Protect the forward-reused prefix of THIS turn's prompt at the exact
+        TOKEN boundary (start=0), plus its output when the output is reused.
+
+        _forward_reuse_depths gives the deepest prefix of this turn's own
+        prompt some later turn reuses (whole leading messages + a char-prefix
+        of the first diverging message). Render that prefix and the full
+        prompt and take their LCP -> the exact materialized token boundary D;
+        protect [0, D), and add a covers_output directive if
+        forward_covers_output (server resolves it to the generated-output
+        range).
+
+        Every turn re-protects the prefix it still carries downstream, so the
+        reused conversation prefix stays retained (TTL refreshed) while the
+        non-reused tail falls to LRU — prompt-centric and block-granular, even
+        where an earlier turn produced the tokens.
+
+        Returns the directives ([] = nothing reused downstream), or None on
+        render failure (caller falls back to the legacy profile path).
+        """
+        segs = self.forward_segments
+        covers_out = self.forward_covers_output
+        if not segs and not covers_out:
+            return []
+        base_body: Dict[str, Any] = {
+            "model": payload.get("model"),
+            "messages": payload.get("messages") or [],
+            "max_tokens": 1,
+        }
+        if payload.get("tools"):
+            base_body["tools"] = payload["tools"]
+        messages = base_body["messages"]
+        pol = self.retention_policy
+        try:
+            full_ids = await _render_token_ids(pol.render_url, base_body)
+        except Exception as e:
+            logger.warning(
+                "Event %s: forward-reuse render failed (%s); falling back to "
+                "profile path", self.event_id, e,
+            )
+            return None
+        if not full_ids:
+            return None
+        # One directive per depth-range; priority tiered by THAT range's breadth.
+        # Segments ascending in depth with non-increasing breadth -> priorities
+        # non-increasing across token positions (prefix-cache validator-safe).
+        directives: List[Dict[str, Any]] = []
+        prev = 0
+        last_breadth = 1
+        for (w, p, breadth) in segs:
+            pref_msgs = list(messages[:w])
+            if p > 0 and w < len(messages):
+                dm = messages[w]
+                c = dm.get("content") if isinstance(dm, dict) else None
+                if isinstance(c, str) and c:
+                    pref_msgs.append({**dm, "content": c[:p]})
+            if not pref_msgs:
+                continue
+            try:
+                prefix_body = dict(base_body)
+                prefix_body["messages"] = pref_msgs
+                prefix_ids = await _render_token_ids(
+                    pol.render_url, prefix_body, cacheable=True
+                )
+            except Exception as e:
+                logger.warning(
+                    "Event %s: forward-reuse render failed (%s); falling back to "
+                    "profile path", self.event_id, e,
+                )
+                return None
+            if prefix_ids is None:
+                return None
+            depth = _lcp_len(prefix_ids, full_ids)
+            if depth > prev:
+                directives.append({
+                    "start": prev,
+                    "end": depth,
+                    "priority": pol._priority_for_breadth(breadth),
+                    "duration": (
+                        breadth * pol.per_span_s
+                        + pol.queue_margin_s + pol.ttl_buffer_s
+                    ),
+                })
+                prev = depth
+                last_breadth = breadth
+        if covers_out:
+            directives.append({
+                "covers_output": True,
+                "priority": pol._priority_for_breadth(last_breadth),
+                "duration": (
+                    last_breadth * pol.per_span_s
+                    + pol.queue_margin_s + pol.ttl_buffer_s
+                ),
+            })
+        return directives
+
+    async def _calibrate_profile_via_render(
+        self, payload: Dict[str, Any]
+    ) -> Optional[List[ReuseSegment]]:
+        """Resolve profile boundaries to EXACT materialized-token coordinates
+        via the serving vLLM's /v1/chat/completions/render endpoint (exact
+        token_ids for a payload, harmony/chat-template rendering included).
+
+        For each distinct end_msg anchor, render the message prefix and take
+        the LCP with the full render — the LCP length is the boundary in
+        server token space regardless of generation-suffix differences.
+        covers_output becomes len(full) + max_tokens (safe overcover; blocks
+        past actual generation never materialize).
+
+        Returns None on any failure (caller falls back to char-ratio rescale).
+        Prefix renders are cached globally since past messages are immutable
+        once substituted, so anchors repeat across a session's later turns.
+        """
+        profile = self.reuse_depth_profile
+        if not profile:
+            return None
+        if not any(seg.end_msg is not None or seg.covers_output for seg in profile):
+            return None  # unanchored legacy profile
+        try:
+            base_body: Dict[str, Any] = {
+                "model": payload.get("model"),
+                "messages": payload.get("messages") or [],
+                "max_tokens": 1,
+            }
+            if payload.get("tools"):
+                base_body["tools"] = payload["tools"]
+            full_ids = await _render_token_ids(
+                self.retention_policy.render_url, base_body
+            )
+            if not full_ids:
+                return None
+            prompt_len = len(full_ids)
+            messages = base_body["messages"]
+            out_cap = int(payload.get("max_tokens") or 0)
+
+            # Resolve each distinct message-anchor once.
+            anchors: Dict[int, int] = {}
+            for seg in profile:
+                m = seg.end_msg
+                if seg.covers_output or m is None or m in anchors:
+                    continue
+                if m <= 0:
+                    anchors[m] = 0
+                    continue
+                if m >= len(messages):
+                    anchors[m] = prompt_len
+                    continue
+                prefix_body = dict(base_body)
+                prefix_body["messages"] = messages[:m]
+                prefix_ids = await _render_token_ids(
+                    self.retention_policy.render_url, prefix_body, cacheable=True
+                )
+                if prefix_ids is None:
+                    return None
+                anchors[m] = _lcp_len(prefix_ids, full_ids)
+
+            calibrated: List[ReuseSegment] = []
+            prev = 0
+            for seg in profile:
+                if seg.covers_output:
+                    # Reuse extends through the producer's generated output.
+                    # Exact output length is unknown at directive time; cover
+                    # up to the max_tokens cap — blocks past actual generation
+                    # never materialize, so overcover is free.
+                    new_end = prompt_len + out_cap
+                else:
+                    new_end = anchors.get(seg.end_msg, seg.end)  # type: ignore[arg-type]
+                new_end = max(new_end, prev)  # keep monotone
+                calibrated.append(ReuseSegment(
+                    start=prev, end=new_end,
+                    breadth=seg.breadth, cold_gap=seg.cold_gap,
+                    end_msg=seg.end_msg, covers_output=seg.covers_output,
+                ))
+                prev = new_end
+            logger.debug(
+                "Event %s: render-calibrated %d segment(s), prompt_len=%d",
+                self.event_id, len(calibrated), prompt_len,
+            )
+            return calibrated
+        except Exception as e:
+            logger.warning(
+                "Event %s: render calibration failed (%s: %s); falling back to rescale",
+                self.event_id, type(e).__name__, e,
+            )
+            return None
+
+    def _rescale_profile_to_materialized(
+        self, profile: Optional[List[ReuseSegment]]
+    ) -> Optional[List[ReuseSegment]]:
+        """Map directive coordinates from recorded-trace token space into the
+        materialized request's token space.
+
+        The profile is computed at graph time from RECORDED messages'
+        estimated token depths, but the actual request differs (substituted
+        live outputs, tool/template preamble, tokenizer differences — observed
+        ~2x on tool-heavy traces). Leaving directives in recorded coordinates
+        protects only a leading fraction of the real reused prefix, squeezing
+        the rest into thrash (measured -25pp hit vs plain LRU).
+
+        Best-effort correction: scale boundaries by the materialized/recorded
+        content-size ratio (same estimator both sides, so its bias cancels)
+        and shift by the tool-definitions preamble the server renders ahead of
+        the messages."""
+        if not profile:
+            return profile
+
+        def _content(m: Any) -> str:
+            c = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+            return c if isinstance(c, str) else ""
+
+        from inference_perf.datagen.otel_trace_to_replay_graph import estimate_tokens
+
+        recorded = sum(estimate_tokens(_content(m)) for m in (self.original_messages or []))
+        actual = sum(estimate_tokens(_content(m)) for m in (self.messages or []))
+        if recorded <= 0 or actual <= 0:
+            return profile
+        scale = actual / recorded
+        offset = 0
+        if self.tool_definitions:
+            try:
+                offset = estimate_tokens(json.dumps(self.tool_definitions))
+            except (TypeError, ValueError):
+                offset = 0
+        if abs(scale - 1.0) < 0.02 and offset == 0:
+            return profile
+        return [
+            ReuseSegment(
+                start=offset + int(seg.start * scale),
+                end=offset + int(seg.end * scale),
+                breadth=seg.breadth,
+                cold_gap=seg.cold_gap,
+            )
+            for seg in profile
+        ]
 
     def _extract_session_id(self) -> str:
         return self.event_id.split(":")[0] if ":" in self.event_id else self.event_id
@@ -521,16 +1140,11 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
         result: List[Dict[str, Any]] = []
         cursor = 0
 
-        # Track where live tool-call assistant messages were inserted so we can
-        # rewrite the tool_call_id values in the role:tool messages that follow.
-        # Each entry is (index_of_assistant_in_result, live_tool_calls_list).
-        #
-        # We use a post-pass rather than rewriting inline because the role:tool
-        # messages live in a later segment ("unique") that hasn't been added to
-        # `result` yet when we process the "output" segment.
-        #
-        # index_of_assistant_in_result == len(result) at the time of the append,
-        # which equals the index the message will occupy after the append.
+        # Track live tool-call assistant messages as (index_in_result, tool_calls)
+        # for a post-pass rewrite of tool_call_id in the role:tool messages that
+        # follow. Post-pass rather than inline because those messages live in a
+        # later ("unique") segment not yet in `result` when the "output" segment
+        # is processed; the recorded index equals len(result) at append time.
         pending_id_rewrites: List[Tuple[int, List[Dict[str, Any]]]] = []
 
         for seg in self.input_segments:
@@ -623,11 +1237,9 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                         )
                         if actual_output:
                             if self.expected_output_is_tool_call:
-                                # The live model returned plain text where a tool call was
-                                # expected (tool_choice was either absent or ignored). The
-                                # successor's role:tool messages will have dangling
-                                # tool_call_id references and the model server will likely
-                                # reject the next request. Treat this event as failed so
+                                # Live model returned plain text where a tool call was expected;
+                                # the successor's role:tool messages would have dangling
+                                # tool_call_id refs and likely get rejected. Fail this event so
                                 # downstream events skip rather than send broken requests.
                                 logger.warning(
                                     f"Event {self.event_id}: original output was a tool call but live model "
@@ -668,10 +1280,8 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                     )
                     result.extend(seg_msgs)
                 else:
-                    # Only take the first seg.message_count messages from the parent.
-                    # The shared segment represents a prefix of the parent's messages,
-                    # not necessarily all of them. This handles cases where the parent
-                    # has more messages than the shared prefix length.
+                    # The shared segment is a prefix of the parent's messages, which may
+                    # have more messages than the shared prefix length.
                     seg_msgs_from_parent = seg_msgs_from_parent[: seg.message_count]
 
                     logger.debug(
@@ -679,7 +1289,6 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                         f"shared segment: using {len(seg_msgs_from_parent)} messages (prefix of parent's messages)"
                     )
 
-                    # Validate that we have the expected number of messages after slicing
                     if len(seg_msgs_from_parent) != seg.message_count:
                         logger.warning(
                             f"Event {self.event_id} shared segment from {seg.source_event_id} "
@@ -694,21 +1303,16 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                             else:
                                 result.append(dict(msg))
             elif seg.type == "unique":
-                # Unique message - inject random session string if:
-                # 1. inject_random_session_id flag is enabled, OR
-                # 2. Session is a duplicate (matches pattern: {id}_dup{number})
+                # Inject the random session string (flag enabled, or a duplicate session)
+                # to invalidate KV-cache reuse across sessions.
                 for msg in seg_msgs:
                     session_id = self._extract_session_id()
                     is_duplicate = ReplayGraphSessionGeneratorBase.is_duplicate_session(session_id)
                     should_inject = (self.inject_random_session_id or is_duplicate) and self.session_random_string
 
                     if should_inject:
-                        # Use the session random string passed from SessionGraphState
-                        # Inject random string into message content
                         msg_copy = dict(msg)
                         original_content = msg_copy.get("content", "")
-
-                        # Prepend random session identifier to content
                         msg_copy["content"] = f"[SESS:{self.session_random_string}] {original_content}"
                         result.append(msg_copy)
                         reason = "flag enabled" if self.inject_random_session_id else "duplicate session"
@@ -720,17 +1324,12 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
 
             cursor += seg.message_count
 
-        # Post-pass: rewrite tool_call_id values in role:tool messages so they match
-        # the live tool call IDs instead of the recorded (now stale) ones.
-        #
-        # Why by index rather than by name: the live model may call the same function
-        # twice, making name-based matching ambiguous. Index is unambiguous — the i-th
-        # role:tool message corresponds to the i-th tool call in the preceding assistant
-        # message (guaranteed by the OpenAI spec).
-        #
-        # We scan forward from the assistant message and rewrite only role:tool messages
-        # that carry a tool_call_id, skipping any intervening non-tool messages
-        # (which are valid in some trace formats).
+        # Post-pass: rewrite tool_call_id in role:tool messages to match the live
+        # tool call IDs instead of the recorded (now stale) ones. By index rather
+        # than name, since the live model may call the same function twice — the
+        # i-th role:tool message corresponds to the i-th tool call in the
+        # preceding assistant message (per the OpenAI spec). Scans forward from
+        # the assistant message, skipping intervening non-tool messages.
         for assistant_idx, live_tool_calls in pending_id_rewrites:
             tool_result_idx = 0
             for result_idx in range(assistant_idx + 1, len(result)):
@@ -1047,6 +1646,7 @@ class ReplaySessionEvent:
     predecessor_event_ids: List[str] = field(default_factory=list)
     wait_ms: int = 0
     tool_definitions: Optional[List[Dict[str, Any]]] = None
+    reuse_depth_profile: Optional[List[ReuseSegment]] = None
 
 
 @dataclass
@@ -1072,6 +1672,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
         base_seed: Optional[int] = None,
         num_workers: int = 1,
         replay_config: Optional[SessionReplayConfig] = None,
+        retention_policy: Any = None,
     ) -> None:
         super().__init__(api_config, config, tokenizer)
         self.config = config
@@ -1079,6 +1680,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
         self.mp_manager = mp_manager
         self.num_workers = max(1, num_workers)
         self.base_seed = base_seed if base_seed is not None else 42
+        self.retention_policy = retention_policy
 
         self.output_registry = EventOutputRegistry()
         self.worker_tracker = WorkerSessionTracker()
@@ -1182,48 +1784,34 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
 
     @staticmethod
     def _duplicate_sessions_if_needed(sessions: List[ReplaySession], target_sessions: int) -> List[ReplaySession]:
-        """Duplicate sessions to ensure we have enough for high-concurrency testing.
-
-        This is useful when the trace corpus is smaller than needed for stress testing.
-        Sessions are duplicated with unique IDs to avoid conflicts.
-
-        Args:
-            sessions: List of sessions to potentially duplicate
-            target_sessions: Target number of sessions to reach by duplication
-
-        Returns:
-            List of sessions (original + duplicates if needed)
-        """
+        """Duplicate sessions (round-robin, unique IDs) to reach target_sessions
+        when the trace corpus is smaller than needed for stress testing."""
         current_count = len(sessions)
 
         if current_count >= target_sessions:
             logger.info(f"Session corpus sufficient: {current_count} sessions available (target: {target_sessions})")
             return sessions
 
-        # Calculate how many duplicates we need
         duplicates_needed = target_sessions - current_count
         logger.warning(
             f"Session corpus small: {current_count} sessions available. "
             f"Duplicating to reach {target_sessions} sessions for stress testing."
         )
 
-        # Duplicate sessions in round-robin fashion
         original_sessions = list(sessions)
         duplicate_count = 0
         session_idx = 0
 
         while len(sessions) < target_sessions:
-            # Get next session to duplicate (round-robin)
             source_session = original_sessions[session_idx % len(original_sessions)]
             session_idx += 1
             duplicate_count += 1
 
-            # Create duplicate with unique ID
-            # Note: session_index will be reassigned in initialize_sessions() to match list position
+            # session_index reassigned in initialize_sessions() to match list position
             duplicate_session = ReplaySession(
                 session_id=f"{source_session.session_id}_dup{duplicate_count}",
                 source_id=source_session.source_id,
-                session_index=-1,  # Placeholder, will be reassigned after duplication
+                session_index=-1,
                 graph=source_session.graph,
                 start_offset_ms=source_session.start_offset_ms,
             )
@@ -1235,18 +1823,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
 
     @staticmethod
     def is_duplicate_session(session_id: str) -> bool:
-        """Check if a session is a duplicate based on its ID.
-
-        Duplicates are created with the pattern: {original_id}_dup{number}
-        This method uses regex to robustly detect this pattern.
-
-        Args:
-            session_id: The session ID to check
-
-        Returns:
-            True if the session is a duplicate, False otherwise
-        """
-        # Match pattern: anything followed by _dup and one or more digits at the end
+        """Check if session_id matches the duplicate pattern {original_id}_dup{number}."""
         return bool(re.search(r"_dup\d+$", session_id))
 
     def get_supported_apis(self) -> List[APIType]:
@@ -1294,6 +1871,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
         )
         self.session_graph_state[session.session_id] = state
 
+        reuse_profiles = _compute_reuse_profiles(list(session.graph.events.values()))
         events: List[ReplaySessionEvent] = []
         for event in session.graph.events.values():
             gc = event.call
@@ -1328,6 +1906,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
                     predecessor_event_ids=qualified_predecessor_ids,
                     wait_ms=min(event.wait_ms, self.replay_config.max_wait_ms) if self.replay_config else event.wait_ms,
                     tool_definitions=gc.tool_definitions,
+                    reuse_depth_profile=reuse_profiles.get(event.event_id),
                 )
             )
         return events
@@ -1588,11 +2167,54 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
 
         gc = state.graph.events[raw_event_id].call if state and raw_event_id in state.graph.events else None
 
+        retention_policy = getattr(self, "retention_policy", None)
+
+        remaining_reuse = 0
+        fwd_segs, fwd_covers = (), False
+        if state and raw_event_id in state.graph.events:
+            cache = getattr(self, "_reuse_count_cache", None)
+            if cache is None:
+                cache = {}
+                self._reuse_count_cache = cache
+            rc = cache.get(session_id)
+            if rc is None:
+                rc = _prefix_reuse_counts(list(state.graph.events.values()))
+                cache[session_id] = rc
+            remaining_reuse = rc.get(raw_event_id, 0)
+            # LIVE-based forward reuse recomputed for this turn (decouples breadth
+            # from in-flight coverage; see _forward_reuse_depths).
+            completed_ids = dispatched_ids = None
+            if retention_policy is not None:
+                assert self.num_workers == 1, (
+                    "Retention directive decoupling assumes single-worker "
+                    "asyncio (num_workers==1); a multi-worker run needs a "
+                    "thread-safe dispatched-set."
+                )
+                completed_ids, dispatched_ids = _lifecycle_sets(
+                    state.graph.events, session_id, self.output_registry,
+                    state.dispatched_events,
+                )
+            fd = _forward_reuse_depths(
+                list(state.graph.events.values()),
+                registry=getattr(self, "output_registry", None),
+                target=raw_event_id,
+                completed_ids=completed_ids,
+                dispatched_ids=dispatched_ids,
+            )
+            fwd_segs, fwd_covers = fd.get(raw_event_id, ((), False))
+            if retention_policy is not None:
+                # Mark THIS turn dispatched AFTER computing (so it never counts
+                # itself). Synchronous section, no await -> atomic under asyncio.
+                state.dispatched_events.add(raw_event_id)
+
         return SessionChatCompletionAPIData(
             messages=chat_messages,
             max_tokens=max_tokens,
             tool_definitions=event.tool_definitions,
             event_id=event.event_id,
+            remaining_reuse=remaining_reuse,
+            forward_segments=fwd_segs,
+            forward_covers_output=fwd_covers,
             registry=self.output_registry,
             worker_tracker=getattr(self, "worker_tracker", WorkerSessionTracker()),
             completion_queue=getattr(self, "session_completion_queue", None),
@@ -1621,6 +2243,9 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
             else False,
             # Back-reference so the event can evict this session from the worker once drained.
             generator=self,
+            # Retention policy (KV-cache retention directive injection)
+            retention_policy=retention_policy,
+            reuse_depth_profile=event.reuse_depth_profile,
         )
 
     def cleanup_session(self, session_id: str) -> None:

@@ -138,7 +138,6 @@ class SessionReplayConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_static_model(self) -> "SessionReplayConfig":
-        # Validate static model configuration
         if self.use_static_model and not self.static_model_name:
             raise ValueError("static_model_name is required when use_static_model=True")
         if not self.use_static_model and self.static_model_name and not self.model_mapping:
@@ -284,3 +283,56 @@ class WekaTraceReplayConfig(SessionReplayConfig):
                 "Cannot specify multiple trace sources; choose one of: trace_directory, trace_files, or hf_dataset_path"
             )
         return self
+
+class RetentionPolicyConfig(BaseModel):
+    """Configuration for KV-cache retention directives.
+
+    Controls whether and how retention_directives are injected into
+    inference requests during agentic / trace-replay workloads. Used to
+    instruct the server to protect KV-cache blocks from eviction during
+    tool-call pauses.
+    """
+
+    type: str = Field(
+        default="workflow_aware",
+        description="Policy type: 'workflow_aware' (DAG oracle TTL + breadth-tier priority + evict-if-unused).",
+    )
+    # Reuse-breadth priority tiers (breadth >=4 -> high, >=2 -> mid, else low).
+    high_breadth_priority: int = Field(default=90, ge=0, le=100)
+    mid_breadth_priority: int = Field(default=70, ge=0, le=100)
+    low_breadth_priority: int = Field(default=50, ge=0, le=100)
+    ttl_buffer_s: float = Field(
+        default=5.0,
+        ge=0,
+        description="Extra seconds added to the per-segment idle-gap TTL",
+    )
+    per_span_s: float = Field(
+        default=9.0,
+        gt=0,
+        description="Estimated wall-clock seconds per intervening span; the "
+        "per-segment TTL scales as cold_gap * per_span_s. Raise to "
+        "match the workload's actual per-turn latency.",
+    )
+    queue_margin_s: float = Field(
+        default=10.0,
+        ge=0,
+        description="Queue-wait margin added to each per-segment idle-gap TTL.",
+    )
+    min_remaining_reuse: int = Field(
+        default=0,
+        ge=0,
+        description="Reuse gate: skip directive if this prompt is reused fewer "
+        "than N more times downstream (0=off). Matches simulator fwd_reuse.",
+    )
+    min_breadth: int = Field(
+        default=0,
+        ge=0,
+        description="Skip directives when max reuse breadth is below this (0=off).",
+    )
+    render_url: Optional[str] = Field(
+        default=None,
+        description="Base URL of a vLLM server exposing /v1/chat/completions/"
+        "render. When set, directive boundaries are calibrated to exact "
+        "materialized token coordinates via render+LCP (fallback: char-ratio "
+        "rescale).",
+    )

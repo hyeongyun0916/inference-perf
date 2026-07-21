@@ -15,7 +15,7 @@ import multiprocessing as mp
 import sys
 from argparse import ArgumentParser
 from inference_perf.analysis.analyze import analyze_reports
-from typing import List, Optional
+from typing import Any, List, Optional
 from inference_perf.client.modelserver.tgi_client import TGImodelServerClient
 from inference_perf.datagen.base import BaseGenerator
 from inference_perf.loadgen import LoadGenerator
@@ -108,6 +108,33 @@ class InferencePerfRunner:
 
     def stop(self) -> None:
         asyncio.run(self.loadgen.stop())
+
+
+def _build_retention_policy(cfg: Any) -> Any:
+    """Construct a RetentionPolicy instance from RetentionPolicyConfig.
+
+    Returns None when no retention_policy is configured (the field is omitted) —
+    the caller treats None as "do not inject retention directives" (LRU baseline).
+    There is no 'none' type: to run the baseline, omit retention_policy entirely.
+    """
+    if cfg is None:
+        return None
+    policy_type = getattr(cfg, "type", "workflow_aware")
+    if policy_type == "workflow_aware":
+        from inference_perf.policies import WorkflowAwarePolicy
+
+        return WorkflowAwarePolicy(
+            ttl_buffer_s=cfg.ttl_buffer_s,
+            high_breadth_priority=cfg.high_breadth_priority,
+            mid_breadth_priority=cfg.mid_breadth_priority,
+            low_breadth_priority=cfg.low_breadth_priority,
+            per_span_s=cfg.per_span_s,
+            queue_margin_s=cfg.queue_margin_s,
+            min_breadth=getattr(cfg, "min_breadth", 0),
+            min_remaining_reuse=getattr(cfg, "min_remaining_reuse", 0),
+            render_url=getattr(cfg, "render_url", None),
+        )
+    raise ValueError(f"Unknown retention policy type: {policy_type!r}")
 
 
 def main_cli() -> None:
@@ -363,8 +390,15 @@ def main_cli() -> None:
         elif config.data.type == DataGenType.VisionArena:
             datagen = VisionArenaDataGenerator(config.api, config.data, tokenizer)
         elif config.data.type == DataGenType.OTelTraceReplay:
+            retention_policy = _build_retention_policy(config.data.retention_policy)
             datagen = OTelTraceReplayDataGenerator(
-                config.api, config.data, tokenizer, mp_manager, config.load.base_seed, num_workers=config.load.num_workers
+                config.api,
+                config.data,
+                tokenizer,
+                mp_manager,
+                config.load.base_seed,
+                num_workers=config.load.num_workers,
+                retention_policy=retention_policy,
             )
         elif config.data.type == DataGenType.WekaTraceReplay:
             datagen = WekaTraceReplayDataGenerator(
