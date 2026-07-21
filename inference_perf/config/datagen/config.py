@@ -22,6 +22,7 @@ from inference_perf.config.datagen.replay import (
     ConversationReplayConfig,
     OTelTraceReplayConfig,
     WekaTraceReplayConfig,
+    RetentionPolicyConfig,
     TraceConfig,
 )
 from inference_perf.config.datagen.visionarena import VisionArenaConfig
@@ -113,6 +114,9 @@ class DataConfig(BaseModel):
 
     # Conversation replay configuration
     conversation_replay: Optional[ConversationReplayConfig] = None
+
+    # Retention policy (KV-cache retention directives)
+    retention_policy: Optional[RetentionPolicyConfig] = None
 
     # VisionArena-Chat dataset configuration
     visionarena: Optional[VisionArenaConfig] = None
