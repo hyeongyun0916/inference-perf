@@ -53,6 +53,9 @@ class WorkflowAwarePolicy:
         min_breadth: int = 0,
         min_remaining_reuse: int = 0,
         render_url: str | None = None,
+        priority_mode: str = "tiered",
+        k_wave: int = 25,
+        per_wave_s: float = 10.0,
     ) -> None:
         self.ttl_buffer_s = ttl_buffer_s
         self.high_breadth_priority = high_breadth_priority
@@ -73,6 +76,15 @@ class WorkflowAwarePolicy:
         # directive boundary to exact materialized token positions before
         # compute_directives is called (None = legacy char-ratio rescale).
         self.render_url = render_url
+        # Breadth->priority mapping mode. "tiered": 3-step (>=4/>=2/else);
+        # "next_use_wave": Belady priority from causal-wave gap to next reuse.
+        self.priority_mode = priority_mode
+        # next_use_wave: priority from time-to-NEXT-reuse (min wave-gap over
+        # forward-future reusers), TTL from time-to-LAST-reuse (max wave-gap).
+        # k_wave scales the per-wave priority drop; per_wave_s maps a causal
+        # wave to wall-clock seconds for the TTL.
+        self.k_wave = k_wave
+        self.per_wave_s = per_wave_s
 
     def compute_directives(
         self,
@@ -112,3 +124,19 @@ class WorkflowAwarePolicy:
         if breadth >= 2:
             return self.mid_breadth_priority
         return self.low_breadth_priority
+
+    def _priority_for_wave(self, min_gap: float | None) -> int:
+        # Smaller gap to the next reuse -> higher priority (Belady). min_gap
+        # carries the within-wave t_start tiebreak as a fraction. None = covered
+        # but no forward-future reuser -> evict-first floor.
+        if min_gap is None:
+            return 1
+        return max(1, min(100, round(100 - self.k_wave * min_gap)))
+
+    def _ttl_for_wave(self, max_gap: int | None) -> float:
+        # Keep until the LAST reuse wave. None = no forward-future reuser ->
+        # only the queue+buffer floor.
+        base = self.queue_margin_s + self.ttl_buffer_s
+        if max_gap is None:
+            return base
+        return max_gap * self.per_wave_s + base

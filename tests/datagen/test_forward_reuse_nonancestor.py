@@ -52,8 +52,10 @@ def test_forward_reuse_basic():
     fd = _forward_reuse_depths([e0, e1, e2], registry=None)
 
     # e0 reused by e1 and e2 at depth 2 -> breadth 2; e1 reused by e2 at depth 4.
-    assert fd["e0"] == (((2, 0, 2),), True), fd["e0"]
-    assert fd["e1"] == (((4, 0, 1),), True), fd["e1"]
+    segs0, covers0 = fd["e0"]
+    segs1, covers1 = fd["e1"]
+    assert [s[:3] for s in segs0] == [(2, 0, 2)] and covers0 is True, fd["e0"]
+    assert [s[:3] for s in segs1] == [(4, 0, 1)] and covers1 is True, fd["e1"]
 
 
 def test_backward_cousin_covered():
@@ -106,7 +108,8 @@ def test_ancestor_excluded():
     fd = _forward_reuse_depths([e0, e1], registry=None)
 
     # e0 is reused forward by e1 (depth 5, full prompt) and covers its output.
-    assert fd["e0"] == (((5, 0, 1),), True), fd["e0"]
+    segs0, covers0 = fd["e0"]
+    assert [s[:3] for s in segs0] == [(5, 0, 1)] and covers0 is True, fd["e0"]
     # e1's only companion is its ancestor e0 -> excluded -> no segments.
     assert fd["e1"] == ((), False), fd["e1"]
 
@@ -121,4 +124,5 @@ def test_missing_predecessors_no_crash():
                                                         _m("assistant", "a0"),
                                                         _m("user", "q1")]))
     fd = _forward_reuse_depths([e0, e1], registry=None)
-    assert fd["e0"] == (((2, 0, 1),), True), fd["e0"]
+    segs0, covers0 = fd["e0"]
+    assert [s[:3] for s in segs0] == [(2, 0, 1)] and covers0 is True, fd["e0"]

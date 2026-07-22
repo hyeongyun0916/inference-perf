@@ -187,31 +187,36 @@ def _forward_reuse_depths(
 ) -> Dict[str, Tuple[tuple, bool]]:
     """Per event, the reuse-depth PROFILE + covers_output, TOKEN-granular.
 
-    Compares recorded message content directly (segment source_event_id
-    attribution under-detects). Comparison set is every non-ancestor turn,
-    split by lifecycle: COMPLETED turns are skipped (they won't reuse anything
-    again). FUTURE turns count toward BREADTH (priority tier + TTL) and
-    coverage. IN-FLIGHT turns (dispatched but not completed) hold COVERAGE
-    only: a depth reused solely by in-flight turns is emitted at a FLOOR
-    breadth of 1 (low priority tier, minimal TTL) so a same-scope turn cannot
-    owner-clear a block an in-flight (e.g. preempted, re-prefilling) turn will
-    hit again, without inflating the tier — breadth stays genuine future reuse
-    while coverage tracks anything still in use.
-
-    Returns (segments, covers_output): segments is a tuple of (shared_msgs,
-    partial_chars, breadth) ascending by depth.
+    Compares recorded message content directly (bypassing the segment
+    source_event_id attribution, which under-detects).
+    The comparison set is every non-ancestor turn, split by lifecycle:
+    COMPLETED turns (event_id in completed_ids) are skipped — they will not
+    reuse anything again. FUTURE turns (event_id not in dispatched_ids, or
+    dispatched_ids is None) count toward BREADTH (priority tier + TTL) and
+    coverage. IN-FLIGHT turns (dispatched but not completed) hold COVERAGE only:
+    a depth reused solely by in-flight turns is emitted at a FLOOR breadth of 1
+    (low priority tier, minimal TTL) so a same-scope turn cannot owner-clear a
+    block an in-flight (e.g. preempted, re-prefilling) turn will hit again,
+    without inflating the tier. This keeps breadth = genuine future reuse
+    (no over-protection) while coverage tracks anything still in use.
+    Returns (segments, covers_output) where segments is a tuple
+    of (shared_msgs, partial_chars, breadth, min_gap, max_gap) ascending by
+    depth:
       - shared_msgs / partial_chars: a depth boundary — whole leading messages
         plus a char-prefix of the first diverging message.
       - breadth: how many comparison turns reuse this event's prompt AT LEAST
-        that deep. Shallower prefixes have higher breadth, hence higher tier.
-      - covers_output: a LATER event reuses this event's FULL prompt and
-        extends past it, so this event's output is reused too (backward
-        siblings never set this — an earlier turn can't consume this output).
-
-    Reuse is prefix-contiguous, so [messages[:shared_msgs] + first
-    partial_chars of the next message] is exactly a reused prefix; the client
-    renders each boundary and LCPs it against the full render to get the exact
-    TOKEN depth."""
+        that deep. Shallower prefixes have higher breadth (more reusers), so
+        they get a higher priority tier.
+      - min_gap / max_gap: min/max causal wave-gap (wave = topological level,
+        root=0) over FORWARD-future reusers reaching this boundary; min_gap
+        adds a (1 - 1/ts_gap) within-wave t_start tiebreak. Both None when no
+        forward-future reuser reaches this boundary (coverage-floor only).
+      - covers_output: a LATER event reuses this event's FULL prompt and extends
+        past it, so this event's generated output is reused too. Backward
+        siblings never set this (an earlier turn cannot consume this output).
+    Reuse is prefix-contiguous, so [messages[:shared_msgs] + first partial_chars
+    of the next message] is exactly a reused prefix; the client renders each
+    boundary and LCPs it against the full render to get the exact TOKEN depth."""
     order = sorted(events, key=lambda e: float(getattr(e, "t_start_ms", 0) or 0))
 
     def _txt(m: Dict[str, Any]) -> str:
@@ -266,6 +271,16 @@ def _forward_reuse_depths(
             stack.extend(_idx_preds[x])
         return seen
 
+    _wave_memo: Dict[int, int] = {}
+
+    def _wave(idx: int) -> int:
+        # Causal level: root=0, else 1 + max over predecessors (AND readiness).
+        if idx in _wave_memo:
+            return _wave_memo[idx]
+        ps = _idx_preds[idx]
+        _wave_memo[idx] = 0 if not ps else 1 + max(_wave(p) for p in ps)
+        return _wave_memo[idx]
+
     out: Dict[str, Tuple[tuple, bool]] = {}
     completed = completed_ids or frozenset()
     for i, ev in enumerate(order):
@@ -274,8 +289,11 @@ def _forward_reuse_depths(
         na = len(msgs[i])
         depths_future: List[Tuple[int, int]] = []
         depths_inflight: List[Tuple[int, int]] = []
+        # Forward-future reusers only: (w, p, wave_gap, ts_gap) for wave stats.
+        fut_wave: List[Tuple[int, int, int, int]] = []
         covers = False
         anc = _ancestors(i)
+        wave_i = _wave(i)
         for j in range(len(order)):  # all non-ancestor turns
             if j == i or j in anc:
                 continue
@@ -286,20 +304,38 @@ def _forward_reuse_depths(
             w, p = _boundary(i, j)
             if w > 0 or p > 0:
                 (depths_future if is_future else depths_inflight).append((w, p))
+                if is_future:
+                    wg = _wave(j) - wave_i
+                    if wg >= 0:  # forward: reuser is at or after target's wave
+                        fut_wave.append((w, p, wg, abs(j - i) or 1))
             # covers_output: a FUTURE, later turn reuses this full prompt+output.
             if is_future and j > i and w >= na and len(msgs[j]) > na:
                 covers = True
+
+        def _gaps(boundary: Tuple[int, int], fut_wave=fut_wave):
+            # min/max wave-gap over forward-future reusers reaching `boundary`.
+            reaching = [(wg, ts) for (w, p, wg, ts) in fut_wave
+                        if (w, p) >= boundary]
+            if not reaching:
+                return None, None
+            min_wg = min(wg for wg, _ in reaching)
+            ts_at_min = min(ts for wg, ts in reaching if wg == min_wg)
+            min_gap = float(min_wg) + (1.0 - 1.0 / ts_at_min)
+            max_gap = max(wg for wg, _ in reaching)
+            return min_gap, max_gap
+
         # future_breadth per boundary; depths reused only by in-flight turns get
         # a floor breadth of 1. Boundaries ascending -> breadth non-increasing
         # (future_breadth is monotone; floors sit only where future_breadth==0,
         # necessarily at or beyond the deepest future boundary).
-        segs_list: List[Tuple[int, int, int]] = []
+        segs_list: List[Tuple[int, int, int, Optional[float], Optional[int]]] = []
         for (bw, bp) in sorted(set(depths_future) | set(depths_inflight)):
             fb = sum(1 for d in depths_future if d >= (bw, bp))
+            min_gap, max_gap = _gaps((bw, bp))
             if fb >= 1:
-                segs_list.append((bw, bp, fb))
+                segs_list.append((bw, bp, fb, min_gap, max_gap))
             elif any(d >= (bw, bp) for d in depths_inflight):
-                segs_list.append((bw, bp, 1))  # floor: coverage only, low tier
+                segs_list.append((bw, bp, 1, min_gap, max_gap))  # coverage floor
         out[ev.event_id] = (tuple(segs_list), covers)
     return out
 
@@ -652,8 +688,12 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
     # 이 이벤트의 전체 프롬프트를 leading prefix로 재사용하는 이후 연속 이벤트 수
     # (첫 미포함에서 중단). = 시뮬레이터 fwd_reuse. 정책의 잔여재사용 게이트용.
     remaining_reuse: int = 0
-    # Forward per-depth reuse profile of this event's prompt; see
-    # _forward_reuse_depths for the (shared_msgs, partial_chars, breadth) shape.
+    # Forward per-DEPTH reuse profile of THIS event's prompt (token-granular),
+    # from _forward_reuse_depths: a tuple of (shared_msgs, partial_chars,
+    # breadth, min_gap, max_gap) segments ascending by depth (breadth =
+    # #later turns reusing >= that depth; min_gap/max_gap = causal wave-gap
+    # bounds over forward-future reusers), plus whether the output is reused.
+    # Each depth-range is protected at a priority tier set by its own breadth.
     forward_segments: tuple = ()
     forward_covers_output: bool = False
     registry: EventOutputRegistry
@@ -817,7 +857,13 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
         directives: List[Dict[str, Any]] = []
         prev = 0
         last_breadth = 1
-        for (w, p, breadth) in segs:
+        last_min_gap: float | None = None
+        last_max_gap: int | None = None
+        wave_mode = getattr(pol, "priority_mode", "tiered") == "next_use_wave"
+        for seg in segs:
+            w, p, breadth = seg[0], seg[1], seg[2]
+            min_gap = seg[3] if len(seg) > 3 else None
+            max_gap = seg[4] if len(seg) > 4 else None
             pref_msgs = list(messages[:w])
             if p > 0 and w < len(messages):
                 dm = messages[w]
@@ -842,25 +888,35 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                 return None
             depth = _lcp_len(prefix_ids, full_ids)
             if depth > prev:
+                if wave_mode:
+                    priority = pol._priority_for_wave(min_gap)
+                    duration = pol._ttl_for_wave(max_gap)
+                else:
+                    priority = pol._priority_for_breadth(breadth)
+                    duration = (breadth * pol.per_span_s
+                                + pol.queue_margin_s + pol.ttl_buffer_s)
                 directives.append({
                     "start": prev,
                     "end": depth,
-                    "priority": pol._priority_for_breadth(breadth),
-                    "duration": (
-                        breadth * pol.per_span_s
-                        + pol.queue_margin_s + pol.ttl_buffer_s
-                    ),
+                    "priority": priority,
+                    "duration": duration,
                 })
                 prev = depth
                 last_breadth = breadth
+                last_min_gap = min_gap
+                last_max_gap = max_gap
         if covers_out:
+            if wave_mode:
+                priority = pol._priority_for_wave(last_min_gap)
+                duration = pol._ttl_for_wave(last_max_gap)
+            else:
+                priority = pol._priority_for_breadth(last_breadth)
+                duration = (last_breadth * pol.per_span_s
+                            + pol.queue_margin_s + pol.ttl_buffer_s)
             directives.append({
                 "covers_output": True,
-                "priority": pol._priority_for_breadth(last_breadth),
-                "duration": (
-                    last_breadth * pol.per_span_s
-                    + pol.queue_margin_s + pol.ttl_buffer_s
-                ),
+                "priority": priority,
+                "duration": duration,
             })
         return directives
 

@@ -41,7 +41,7 @@ def _ev(event_id, t, preds, messages):
 
 
 def _breadths(segs):
-    return [b for (_w, _p, b) in segs]
+    return [b for (_w, _p, b, *_rest) in segs]
 
 
 # Shared prompt prefix: all turns share message[0]; deeper sharing varies.

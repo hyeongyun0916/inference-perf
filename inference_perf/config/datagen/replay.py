@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -301,6 +301,22 @@ class RetentionPolicyConfig(BaseModel):
     high_breadth_priority: int = Field(default=90, ge=0, le=100)
     mid_breadth_priority: int = Field(default=70, ge=0, le=100)
     low_breadth_priority: int = Field(default=50, ge=0, le=100)
+    priority_mode: Literal["tiered", "next_use_wave"] = Field(
+        default="tiered",
+        description="priority mapping: 'tiered' (3-step 90/70/50) or "
+        "'next_use_wave' (Belady: priority from min causal-wave gap to "
+        "next reuse).",
+    )
+    k_wave: int = Field(
+        default=25, ge=1, le=100,
+        description="next_use_wave: per-wave priority drop "
+        "(priority = clamp(100 - k_wave*min_gap, 1, 100)).",
+    )
+    per_wave_s: float = Field(
+        default=10.0, gt=0,
+        description="next_use_wave: wall-clock seconds per causal wave; "
+        "TTL = max_gap * per_wave_s + queue_margin_s + ttl_buffer_s.",
+    )
     ttl_buffer_s: float = Field(
         default=5.0,
         ge=0,

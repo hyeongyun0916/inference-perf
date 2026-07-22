@@ -133,6 +133,9 @@ def _build_retention_policy(cfg: Any) -> Any:
             min_breadth=getattr(cfg, "min_breadth", 0),
             min_remaining_reuse=getattr(cfg, "min_remaining_reuse", 0),
             render_url=getattr(cfg, "render_url", None),
+            priority_mode=getattr(cfg, "priority_mode", "tiered"),
+            k_wave=getattr(cfg, "k_wave", 25),
+            per_wave_s=getattr(cfg, "per_wave_s", 10.0),
         )
     raise ValueError(f"Unknown retention policy type: {policy_type!r}")
 
