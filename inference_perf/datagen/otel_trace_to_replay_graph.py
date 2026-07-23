@@ -363,8 +363,49 @@ def _convert_content_and_tool_calls_to_parts(message: Dict[str, Any]) -> Dict[st
     return result
 
 
+def _system_instructions_text(attrs: Dict[str, Any]) -> Optional[str]:
+    """Text of gen_ai.system_instructions (a parts list or plain string), or None.
+
+    The trace records the system prompt separately from gen_ai.input.messages;
+    replaying only the messages drops it and the replayed prompt loses the
+    system instruction. Returned so it can be prepended as a leading system
+    message, restoring fidelity.
+    """
+    raw = attrs.get("gen_ai.system_instructions")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        if s[0] in "[{":
+            try:
+                raw = json.loads(s)
+            except Exception:
+                return s
+        else:
+            return s
+    if isinstance(raw, dict):
+        raw = [raw]
+    if isinstance(raw, list):
+        parts = []
+        for p in raw:
+            if isinstance(p, dict):
+                c = p.get("content", p.get("text"))
+                parts.append(c if isinstance(c, str) else json.dumps(c, sort_keys=True, default=str))
+            elif isinstance(p, str):
+                parts.append(p)
+        text = "\n".join(x for x in parts if x).strip()
+        return text or None
+    return None
+
+
 def extract_messages(span: Dict[str, Any]) -> Tuple[List["ReplayMessage"], int]:
     """Extract messages from span attributes.
+
+    A non-empty gen_ai.system_instructions is prepended as a leading system
+    message (the trace stores it apart from gen_ai.input.messages; sending only
+    the messages would drop it).
 
     Returns a tuple of (messages, developer_role_normalized_count).
     """
@@ -429,6 +470,9 @@ def extract_messages(span: Dict[str, Any]) -> Tuple[List["ReplayMessage"], int]:
 
                 """
                 res.append(ComplexReplayMessage(role=role, message_info=x, raw_reconstructed_text=reconstruct_llm_input(x)))
+        si_text = _system_instructions_text(attrs)
+        if si_text:
+            res.insert(0, ReplayMessage(role="system", text=si_text))
         return res, normalized_count  # type: ignore[return-value]
     else:
         return [], 0

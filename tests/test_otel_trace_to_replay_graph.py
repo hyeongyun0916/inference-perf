@@ -746,3 +746,47 @@ class TestDeveloperRoleNormalization:
         assert isinstance(msg, ComplexReplayMessage)
         assert msg.message_info["role"] == "system"
         assert normalized_count == 1
+
+
+class TestSystemInstructionsPrepended:
+    """gen_ai.system_instructions is restored as a leading system message."""
+
+    def test_parts_list_prepended_as_system(self) -> None:
+        span = {
+            "attributes": {
+                "gen_ai.system_instructions": json.dumps(
+                    [{"type": "text", "content": "You are an agent. Follow the policy."}]
+                ),
+                "gen_ai.input.messages": json.dumps(
+                    [{"role": "user", "content": "Task: book a flight."}]
+                ),
+            },
+        }
+        messages, _ = extract_messages(span)
+        assert len(messages) == 2
+        assert messages[0].role == "system"
+        assert "Follow the policy" in messages[0].text
+        assert messages[1].role == "user"
+
+    def test_string_form_prepended(self) -> None:
+        span = {
+            "attributes": {
+                "gen_ai.system_instructions": "Be concise.",
+                "gen_ai.input.messages": json.dumps([{"role": "user", "content": "Hi"}]),
+            },
+        }
+        messages, _ = extract_messages(span)
+        assert len(messages) == 2
+        assert messages[0].role == "system"
+        assert messages[0].text == "Be concise."
+
+    def test_absent_or_empty_not_prepended(self) -> None:
+        span = {
+            "attributes": {
+                "gen_ai.system_instructions": "",
+                "gen_ai.input.messages": json.dumps([{"role": "user", "content": "Hi"}]),
+            },
+        }
+        messages, _ = extract_messages(span)
+        assert len(messages) == 1
+        assert messages[0].role == "user"
