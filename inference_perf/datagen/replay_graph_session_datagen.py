@@ -791,10 +791,20 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
         if getattr(self.retention_policy, "render_url", None):
             directives = await self._forward_reuse_directives(payload)
             if directives is not None:
-                if not directives:
-                    return None  # request reuses nothing → no directive (LRU)
-                result: dict[str, Any] = {"retention_directives": directives}
                 scope = self._extract_session_id()
+                _turn = getattr(self, "event_id", None)
+                if not directives:
+                    # reuses nothing → no directive (LRU). Still emit scope+turn
+                    # so the server logs rid↔session/turn (metadata only; no
+                    # directives = no protection applied).
+                    r0: dict[str, Any] = {"retention_turn": _turn}
+                    if scope is not None:
+                        r0["retention_scope"] = scope
+                    return r0
+                result: dict[str, Any] = {
+                    "retention_directives": directives,
+                    "retention_turn": _turn,
+                }
                 if scope is not None:
                     result["retention_scope"] = scope
                 return result
