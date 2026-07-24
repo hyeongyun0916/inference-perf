@@ -832,16 +832,16 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
 
         Every turn re-protects the prefix it still carries downstream, so the
         reused conversation prefix stays retained (TTL refreshed) while the
-        non-reused tail falls to LRU — prompt-centric and block-granular, even
-        where an earlier turn produced the tokens.
+        non-reused tail is FLOOR-covered (priority 1, evict-first but tracked)
+        so no prompt block is left uncovered — prompt-centric and
+        block-granular, even where an earlier turn produced the tokens.
 
-        Returns the directives ([] = nothing reused downstream), or None on
-        render failure (caller falls back to the legacy profile path).
+        Returns the directives (always at least a FLOOR-priority tail covering
+        the non-reused remainder of this prompt), or None on render failure
+        (caller falls back to the legacy profile path).
         """
         segs = self.forward_segments
         covers_out = self.forward_covers_output
-        if not segs and not covers_out:
-            return []
         base_body: Dict[str, Any] = {
             "model": payload.get("model"),
             "messages": payload.get("messages") or [],
@@ -915,6 +915,22 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                 last_breadth = breadth
                 last_min_gap = min_gap
                 last_max_gap = max_gap
+        # FLOOR-cover the non-reused tail [prev, len(full_ids)) so NO prompt
+        # block is left uncovered. An uncovered block that another session
+        # protects (the shared harmony/system prefix) is owner-cleared when
+        # this turn re-caches it with no covering directive (server pops the
+        # meta on best_priority < 0). FLOOR (priority 1) keeps it tracked and
+        # evict-first: a cross-session HIGH still wins (server takes max), a
+        # same-scope owner is downgraded (meta kept, not popped), an untracked
+        # block is set to FLOOR. For a no-forward-reuse turn prev == 0, so this
+        # covers the whole prompt.
+        if prev < len(full_ids):
+            directives.append({
+                "start": prev,
+                "end": len(full_ids),
+                "priority": 1,
+                "duration": pol.queue_margin_s + pol.ttl_buffer_s,
+            })
         if covers_out:
             if wave_mode:
                 priority = pol._priority_for_wave(last_min_gap)

@@ -103,3 +103,50 @@ def test_covers_output_uses_last_seg_wave(monkeypatch):
     assert directives[-1]["covers_output"] is True
     assert directives[-1]["priority"] == 75  # _priority_for_wave(1.0)
     assert directives[-1]["duration"] == 2 * 10.0 + 70.0  # _ttl_for_wave(2)
+
+
+def test_floor_tail_covers_non_reused_remainder(monkeypatch):
+    # Forward reuse stops short of the full prompt -> the tail [prev, len) must
+    # be FLOOR-covered so no prompt block is left uncovered (owner-clear guard).
+    monkeypatch.setattr(dg, "_render_token_ids", _render_stub(0))
+    pol = WorkflowAwarePolicy(
+        priority_mode="next_use_wave", k_wave=25, per_wave_s=10.0,
+        queue_margin_s=60.0, ttl_buffer_s=10.0, render_url="http://x",
+    )
+    # 2 messages -> full_ids [0,1,2]; seg reuses only the first message -> depth
+    # 2, leaving [2,3) as the non-reused tail.
+    segs = ((1, 0, 3, 1.0, 2),)
+    obj = _api(segs, False, pol)
+    payload = {
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "yo"},
+        ],
+    }
+    directives = asyncio.run(obj._forward_reuse_directives(payload))
+    assert len(directives) == 2
+    assert directives[0]["priority"] == 75  # forward reuse keeps its priority
+    tail = directives[-1]
+    assert tail["start"] == 2 and tail["end"] == 3
+    assert tail["priority"] == 1  # FLOOR
+    assert tail["duration"] == 60.0 + 10.0  # queue_margin + ttl_buffer
+
+
+def test_no_forward_reuse_emits_floor_full_prefix(monkeypatch):
+    # The owner-clear fix: a turn that reuses nothing downstream used to return
+    # [] (no directive -> server owner-clears the shared prefix it re-caches).
+    # It now emits a single FLOOR directive over the whole prompt [0, len).
+    monkeypatch.setattr(dg, "_render_token_ids", _render_stub(0))
+    pol = WorkflowAwarePolicy(
+        priority_mode="next_use_wave", k_wave=25, per_wave_s=10.0,
+        queue_margin_s=60.0, ttl_buffer_s=10.0, render_url="http://x",
+    )
+    obj = _api((), False, pol)  # no forward segments, no covered output
+    payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    directives = asyncio.run(obj._forward_reuse_directives(payload))
+    assert len(directives) == 1
+    d = directives[0]
+    assert d["start"] == 0 and d["end"] == 2  # full prompt (full_ids [0,1])
+    assert d["priority"] == 1  # FLOOR
+    assert d["duration"] == 60.0 + 10.0
