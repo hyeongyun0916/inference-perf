@@ -944,6 +944,20 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                 "priority": priority,
                 "duration": duration,
             })
+        else:
+            # Same guard as the prompt tail, for the generated output: the blocks
+            # holding this turn's output get cached whether or not anything
+            # reuses them, and an uncovered block that this session already owns
+            # is owner-cleared when it is re-cached (no matching directive +
+            # same scope -> the server pops the meta). That destroys protection
+            # the next turn just established on the very block it reuses, so
+            # cover the output at FLOOR too: tracked, evict-first, never
+            # cleared, and freely escalated by whoever reuses it.
+            directives.append({
+                "covers_output": True,
+                "priority": 1,
+                "duration": pol.queue_margin_s + pol.ttl_buffer_s,
+            })
         return directives
 
     async def _calibrate_profile_via_render(

@@ -118,9 +118,10 @@ def test_no_downstream_reuse_floor_covers_prompt(monkeypatch):
     data.remaining_reuse = 0
     dirs = asyncio.run(data._forward_reuse_directives(
         {"model": "m", "messages": [{"role": "user", "content": "u"}]}))
-    assert len(dirs) == 1
-    assert dirs[0]["start"] == 0 and dirs[0]["end"] == 2
-    assert dirs[0]["priority"] == 1
+    ranges = [d for d in dirs if not d.get("covers_output")]
+    assert len(ranges) == 1
+    assert ranges[0]["start"] == 0 and ranges[0]["end"] == 2
+    assert ranges[0]["priority"] == 1
 
 
 def test_forward_render_failure_falls_back_to_none(monkeypatch):

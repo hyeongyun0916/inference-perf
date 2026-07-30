@@ -53,9 +53,10 @@ def test_directive_priority_from_wave_gap(monkeypatch):
     obj = _api(segs, False, pol)
     payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     directives = asyncio.run(obj._forward_reuse_directives(payload))
-    assert len(directives) == 1
-    assert directives[0]["priority"] == 75
-    assert directives[0]["duration"] == 2 * 10.0 + 70.0
+    ranges = [d for d in directives if not d.get("covers_output")]
+    assert len(ranges) == 1
+    assert ranges[0]["priority"] == 75
+    assert ranges[0]["duration"] == 2 * 10.0 + 70.0
 
 
 def test_directive_floor_when_gap_none(monkeypatch):
@@ -125,12 +126,32 @@ def test_floor_tail_covers_non_reused_remainder(monkeypatch):
         ],
     }
     directives = asyncio.run(obj._forward_reuse_directives(payload))
-    assert len(directives) == 2
-    assert directives[0]["priority"] == 75  # forward reuse keeps its priority
-    tail = directives[-1]
+    ranges = [d for d in directives if not d.get("covers_output")]
+    assert len(ranges) == 2
+    assert ranges[0]["priority"] == 75  # forward reuse keeps its priority
+    tail = ranges[-1]
     assert tail["start"] == 2 and tail["end"] == 3
     assert tail["priority"] == 1  # FLOOR
     assert tail["duration"] == 60.0 + 10.0  # queue_margin + ttl_buffer
+
+
+def test_output_is_floor_covered_when_not_forward_reused(monkeypatch):
+    # The turn's output blocks are cached regardless of downstream reuse. Left
+    # uncovered, the server owner-clears the protection a later turn put on the
+    # block it reuses, so the output must carry a FLOOR directive too.
+    monkeypatch.setattr(dg, "_render_token_ids", _render_stub(0))
+    pol = WorkflowAwarePolicy(
+        priority_mode="next_use_wave", k_wave=25, per_wave_s=10.0,
+        queue_margin_s=60.0, ttl_buffer_s=10.0, render_url="http://x",
+    )
+    segs = ((1, 0, 3, 1.0, 2),)
+    obj = _api(segs, False, pol)  # forward_covers_output = False
+    payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    directives = asyncio.run(obj._forward_reuse_directives(payload))
+    out = [d for d in directives if d.get("covers_output")]
+    assert len(out) == 1
+    assert out[0]["priority"] == 1  # FLOOR
+    assert out[0]["duration"] == 60.0 + 10.0
 
 
 def test_no_forward_reuse_emits_floor_full_prefix(monkeypatch):
@@ -145,8 +166,9 @@ def test_no_forward_reuse_emits_floor_full_prefix(monkeypatch):
     obj = _api((), False, pol)  # no forward segments, no covered output
     payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     directives = asyncio.run(obj._forward_reuse_directives(payload))
-    assert len(directives) == 1
-    d = directives[0]
+    ranges = [d for d in directives if not d.get("covers_output")]
+    assert len(ranges) == 1
+    d = ranges[0]
     assert d["start"] == 0 and d["end"] == 2  # full prompt (full_ids [0,1])
     assert d["priority"] == 1  # FLOOR
     assert d["duration"] == 60.0 + 10.0
