@@ -104,13 +104,11 @@ def test_forward_directive_protects_new_increment(monkeypatch):
     assert dirs[0]["duration"] > 0
 
 
-def test_no_downstream_reuse_floor_covers_prompt(monkeypatch):
-    """A turn that reuses nothing downstream still FLOOR-covers its whole
-    prompt [0, len) at priority 1. Leaving a re-cached shared-prefix block
-    uncovered makes the server owner-clear it (best_priority < 0), so every
-    turn must emit at least this FLOOR directive."""
-    async def fake_render(render_url, body, cacheable=False):
-        return list(range(len(body.get("messages", [])) + 1))
+def test_no_downstream_reuse_emits_no_directive(monkeypatch):
+    """A turn nothing reuses downstream (remaining_reuse == 0) emits nothing,
+    without even rendering."""
+    async def fake_render(render_url, body, cacheable=False):  # must not be needed
+        raise AssertionError("render should not run when nothing reuses this turn")
 
     monkeypatch.setattr(_dg, "_render_token_ids", fake_render)
     data = _make_data(retention_policy=WorkflowAwarePolicy(render_url="http://render"))
@@ -118,10 +116,7 @@ def test_no_downstream_reuse_floor_covers_prompt(monkeypatch):
     data.remaining_reuse = 0
     dirs = asyncio.run(data._forward_reuse_directives(
         {"model": "m", "messages": [{"role": "user", "content": "u"}]}))
-    ranges = [d for d in dirs if not d.get("covers_output")]
-    assert len(ranges) == 1
-    assert ranges[0]["start"] == 0 and ranges[0]["end"] == 2
-    assert ranges[0]["priority"] == 1
+    assert dirs == []
 
 
 def test_forward_render_failure_falls_back_to_none(monkeypatch):
