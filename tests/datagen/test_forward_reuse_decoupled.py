@@ -107,6 +107,25 @@ def test_inflight_only_depth_is_covered_at_floor():
     assert set(_breadths(segs)) == {1}
 
 
+def test_inflight_reuser_marks_covers_output():
+    # A dispatched-but-unfinished turn that extends the target's full prompt
+    # will read the target's OUTPUT blocks, exactly as a future turn would. The
+    # prompt boundaries already hold coverage at floor for in-flight reuse, so
+    # skipping the output left it unprotected while it was being reused.
+    sys_m = _m("system", "SYSPROMPT")
+    t0 = _ev("t0", 0, [], [sys_m, _m("user", "Q")])
+    t1 = _ev(
+        "t1", 10, ["t0"],
+        [sys_m, _m("user", "Q"), _m("assistant", "A"), _m("user", "Q2")],
+    )
+    out = _forward_reuse_depths(
+        [t0, t1], target="t0",
+        completed_ids=set(), dispatched_ids={"t0", "t1"},  # t1 in-flight
+    )
+    _segs, covers = out["t0"]
+    assert covers is True, "an in-flight reuser of the output must mark coverage"
+
+
 def test_backward_future_cousin_is_counted():
     # A turn earlier in t_start but NOT yet dispatched is 'future' -> counted
     # (closes the original cross-branch coverage gap; uses dispatch, not t_start).

@@ -308,8 +308,12 @@ def _forward_reuse_depths(
                     wg = _wave(j) - wave_i
                     if wg >= 0:  # forward: reuser is at or after target's wave
                         fut_wave.append((w, p, wg, abs(j - i) or 1))
-            # covers_output: a FUTURE, later turn reuses this full prompt+output.
-            if is_future and j > i and w >= na and len(msgs[j]) > na:
+            # covers_output: a later turn reuses this full prompt+output. An
+            # in-flight reuser counts too — it reads those blocks just as a
+            # future one does, and the boundaries above already hold coverage
+            # at floor for in-flight reuse. Requiring is_future here left a
+            # turn's output unprotected while a dispatched turn was reusing it.
+            if j > i and w >= na and len(msgs[j]) > na:
                 covers = True
 
         def _gaps(boundary: Tuple[int, int], fut_wave=fut_wave):
