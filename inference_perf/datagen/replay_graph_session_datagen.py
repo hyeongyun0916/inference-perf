@@ -211,9 +211,10 @@ def _forward_reuse_depths(
         root=0) over FORWARD-future reusers reaching this boundary; min_gap
         adds a (1 - 1/ts_gap) within-wave t_start tiebreak. Both None when no
         forward-future reuser reaches this boundary (coverage-floor only).
-      - covers_output: a LATER event reuses this event's FULL prompt and extends
-        past it, so this event's generated output is reused too. Backward
-        siblings never set this (an earlier turn cannot consume this output).
+      - covers_output: some event carries this event's FULL prompt and extends
+        past it, so it consumes this event's generated output. Carrying the
+        prompt in full is the test — an in-flight reuser and one recorded
+        earlier both count, the same lifecycle rules the boundaries use.
     Reuse is prefix-contiguous, so [messages[:shared_msgs] + first partial_chars
     of the next message] is exactly a reused prefix; the client renders each
     boundary and LCPs it against the full render to get the exact TOKEN depth."""
@@ -308,12 +309,15 @@ def _forward_reuse_depths(
                     wg = _wave(j) - wave_i
                     if wg >= 0:  # forward: reuser is at or after target's wave
                         fut_wave.append((w, p, wg, abs(j - i) or 1))
-            # covers_output: a later turn reuses this full prompt+output. An
-            # in-flight reuser counts too — it reads those blocks just as a
-            # future one does, and the boundaries above already hold coverage
-            # at floor for in-flight reuse. Requiring is_future here left a
-            # turn's output unprotected while a dispatched turn was reusing it.
-            if j > i and w >= na and len(msgs[j]) > na:
+            # covers_output: a turn whose prompt contains this whole prompt and
+            # extends past it consumes this turn's output, so those blocks are
+            # reused. Carrying this prompt in full is what makes it a consumer —
+            # neither dispatch state nor recorded t_start order changes that,
+            # and the boundaries above already dropped both assumptions (an
+            # in-flight turn holds coverage, and a reuser recorded earlier still
+            # counts). Requiring them here left the output unprotected while it
+            # was being read.
+            if w >= na and len(msgs[j]) > na:
                 covers = True
 
         def _gaps(boundary: Tuple[int, int], fut_wave=fut_wave):

@@ -126,6 +126,27 @@ def test_inflight_reuser_marks_covers_output():
     assert covers is True, "an in-flight reuser of the output must mark coverage"
 
 
+def test_backward_future_reuser_marks_covers_output():
+    # Recorded t_start does not decide who consumes an output: a turn whose
+    # prompt carries the target's full prompt and extends past it reads the
+    # target's output blocks even when the trace recorded it as starting
+    # earlier. The boundaries already use dispatch state rather than t_start
+    # (see test_backward_future_cousin_is_counted); coverage of the output has
+    # to follow the same rule or those blocks are reused unprotected.
+    sys_m = _m("system", "SYSPROMPT")
+    target = _ev("t5", 50, [], [sys_m, _m("user", "Q")])
+    reuser = _ev(
+        "t2", 20, ["t5"],
+        [sys_m, _m("user", "Q"), _m("assistant", "A"), _m("user", "Q2")],
+    )
+    out = _forward_reuse_depths(
+        [target, reuser], target="t5",
+        completed_ids=set(), dispatched_ids={"t5"},  # reuser still to come
+    )
+    _segs, covers = out["t5"]
+    assert covers is True, "a reuser recorded earlier still consumes the output"
+
+
 def test_backward_future_cousin_is_counted():
     # A turn earlier in t_start but NOT yet dispatched is 'future' -> counted
     # (closes the original cross-branch coverage gap; uses dispatch, not t_start).
