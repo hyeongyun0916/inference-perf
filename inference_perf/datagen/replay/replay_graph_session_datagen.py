@@ -23,6 +23,7 @@ affinity, lazy request materialization, and session completion tracking.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -230,6 +231,115 @@ class WorkerSessionTracker:
         # A set (not a counter) makes drain accounting idempotent: an event that passes
         # through more than one terminal path is counted at most once.
         self._drained_events: Dict[str, Set[str]] = {}
+        # Replay of a recorded global send order. Which session's turn goes out
+        # next is normally decided by whose response came back first, so two runs
+        # of the same workload agree on only 6% of positions -- and the order is
+        # what a next-use priority is a claim about. Replaying a recorded order
+        # holds it fixed across arms, leaving the policy as the only difference.
+        self._order_index: Dict[str, int] = {}
+        self._order_next = 0
+        self._order_timeout_s = 3600.0
+        self._order_cond: Optional[asyncio.Condition] = None
+        self._inflight_limit: Optional[int] = None
+        self._inflight_sem: Optional[asyncio.Semaphore] = None
+        self._order_untracked = 0
+        self._order_forced = 0
+        self._order_violations = 0
+
+    def configure_inflight_cap(self, limit: Optional[int]) -> None:
+        """Cap how many requests may be outstanding at the server at once.
+
+        Not the same knob as concurrent_sessions: every session stays live, so
+        the prefix sharing between them is unchanged; only the depth of the
+        server's waiting queue is. That depth turned out to set the hit rate --
+        130 deep read 61.84%, 74 deep read 68.28% on the same workload -- because
+        it is the gap between a prefix being written and the turn that reuses it
+        being scheduled, and the cache is what has to survive that gap.
+        """
+        self._inflight_limit = limit
+        self._inflight_sem = None
+
+    def inflight_slot(self) -> contextlib.AbstractAsyncContextManager[Any]:
+        if not self._inflight_limit:
+            return contextlib.nullcontext()
+        if self._inflight_sem is None:
+            self._inflight_sem = asyncio.Semaphore(self._inflight_limit)
+        return self._inflight_sem
+
+    def configure_send_order(self, path: Optional[str], timeout_s: float) -> None:
+        if not path:
+            return
+        with open(path) as f:
+            keys = [ln.split()[-1] for ln in f if ln.strip()]
+        self._order_index = {k: i for i, k in enumerate(keys)}
+        self._order_timeout_s = timeout_s
+        logger.info("send-order gate: %d recorded positions, timeout %.0fs", len(self._order_index), timeout_s)
+
+    def release_send_slot(self, event_key: str) -> None:
+        """An event that will never be sent must not hold the queue behind it."""
+        idx = self._order_index.get(event_key)
+        if idx is None or self._order_cond is None:
+            if idx is not None:
+                self._order_next = max(self._order_next, idx + 1)
+            return
+        if self._order_next <= idx:
+            self._order_next = idx + 1
+            self._wake()
+
+    def _wake(self) -> None:
+        cond = self._order_cond
+        if cond is None:
+            return
+
+        async def _n() -> None:
+            async with cond:
+                cond.notify_all()
+
+        try:
+            asyncio.get_running_loop().create_task(_n())
+        except RuntimeError:
+            pass
+
+    async def await_send_turn(self, event_key: str) -> None:
+        """Block until every earlier recorded position has gone out."""
+        if not self._order_index:
+            return
+        idx = self._order_index.get(event_key)
+        if idx is None:
+            self._order_untracked += 1
+            return
+        if self._order_cond is None:
+            self._order_cond = asyncio.Condition()
+        async with self._order_cond:
+            while self._order_next < idx:
+                try:
+                    await asyncio.wait_for(self._order_cond.wait(), self._order_timeout_s)
+                except asyncio.TimeoutError:
+                    # The position ahead belongs to a turn this run has not
+                    # reached -- a failed predecessor, or simply a session
+                    # running slower than the one that was recorded. Give up on
+                    # that ONE position and keep waiting. Jumping straight to
+                    # our own position releases everything in between at once,
+                    # which is how the first attempt at this ended up honouring
+                    # only 31% of the recorded order.
+                    self._order_next += 1
+                    self._order_forced += 1
+                    self._order_violations += 1
+                    logger.warning(
+                        "send-order gate: gave up recorded position %d after %.0fs",
+                        self._order_next - 1,
+                        self._order_timeout_s,
+                    )
+                    self._order_cond.notify_all()
+            self._order_next = max(self._order_next, idx + 1)
+            self._order_cond.notify_all()
+
+    def send_order_stats(self) -> Dict[str, int]:
+        return {
+            "violations": self._order_violations,
+            "forced_positions": self._order_forced,
+            "untracked": self._order_untracked,
+        }
 
     def record_event_drained(self, session_id: str, event_id: str) -> int:
         """Mark one event as drained (terminal) and return the session's drained count.
@@ -240,6 +350,12 @@ class WorkerSessionTracker:
         """
         drained = self._drained_events.setdefault(session_id, set())
         drained.add(event_id)
+        # An event that reached a terminal state without being sent holds a
+        # recorded position nobody will ever claim. Releasing it here -- on the
+        # one path every terminal state goes through -- is what lets the gate
+        # wait indefinitely for the positions that ARE still coming, instead of
+        # giving up after a timeout and honouring only half the recorded order.
+        self.release_send_slot(event_id)
         return len(drained)
 
     def forget_session(self, session_id: str) -> None:
@@ -522,6 +638,7 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
         self.worker_tracker.mark_session_failed(session_id, cause, reason)
         self.registry.record_failure(self.event_id)
         logger.info(f"Event {self.event_id} skipping — {reason}")
+        self.worker_tracker.release_send_slot(self.event_id)
 
         if not was_already_failed and self.completion_queue is not None:
             completion_time = time.perf_counter()
@@ -1415,6 +1532,13 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
 
         self.output_registry = EventOutputRegistry()
         self.worker_tracker = WorkerSessionTracker()
+        self.worker_tracker.configure_inflight_cap(
+            getattr(self.replay_config, "max_inflight_requests", None) if self.replay_config else None
+        )
+        self.worker_tracker.configure_send_order(
+            getattr(self.replay_config, "send_order_file", None) if self.replay_config else None,
+            getattr(self.replay_config, "send_order_timeout_s", 20.0) if self.replay_config else 20.0,
+        )
         if mp_manager is not None:
             self.session_completion_queue: Any = mp_manager.Queue()
         else:

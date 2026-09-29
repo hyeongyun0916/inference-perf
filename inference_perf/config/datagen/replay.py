@@ -248,6 +248,30 @@ class OTelTraceReplayConfig(SessionReplayConfig):
         None, description="Map OTel span attributes to metrics reporting labels"
     )
 
+    send_order_file: Optional[str] = Field(
+        None,
+        description=(
+            "File of recorded request send order, one line per request whose last whitespace-separated "
+            "token is the event key. When set, each request waits until every earlier recorded position "
+            "has been sent, so two runs present the server the same arrival order."
+        ),
+    )
+    send_order_timeout_s: float = Field(
+        3600.0,
+        description=(
+            "Seconds a request waits on one earlier send_order_file position before giving up on that "
+            "position (logged as a send-order violation) and moving on."
+        ),
+    )
+    max_inflight_requests: Optional[int] = Field(
+        None,
+        description=(
+            "Cap on requests outstanding at the server at once, held across retries. Unlike "
+            "concurrent_sessions it leaves every session live, so only the server's queue depth "
+            "changes. None = no cap."
+        ),
+    )
+
     @model_validator(mode="after")
     def validate_trace_sources(self) -> "OTelTraceReplayConfig":
         # Validate that exactly one of trace_directory, trace_files, or hf_dataset_path is provided

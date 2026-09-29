@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 from abc import abstractmethod
 from inference_perf.metrics.request_collector import RequestMetricCollector
 from inference_perf.config import APIConfig, APIType, CustomTokenizerConfig, MultiLoRAConfig
@@ -477,6 +478,21 @@ class openAIModelServerClientSession(ModelServerClientSession):
             )
 
     async def process_request(
+        self, data: InferenceAPIData, stage_id: int, scheduled_time: float, lora_adapter: Optional[str] = None
+    ) -> None:
+        # Only trace-replay data declares a worker_tracker (send-order gate, inflight cap).
+        declares_tracker = "worker_tracker" in getattr(type(data), "model_fields", {})
+        tracker: Any = getattr(data, "worker_tracker", None) if declares_tracker else None
+        if tracker is not None:
+            await tracker.await_send_turn(getattr(data, "event_id", ""))
+        # The slot is taken after the order gate, so whoever holds one has really
+        # been dispatched -- holding a slot while still waiting for a turn would
+        # deadlock the two against each other -- and it is held across retries,
+        # because a retry is the same request, not a new one competing for room.
+        async with tracker.inflight_slot() if tracker is not None else contextlib.nullcontext():
+            await self._process_request(data, stage_id, scheduled_time, lora_adapter)
+
+    async def _process_request(
         self, data: InferenceAPIData, stage_id: int, scheduled_time: float, lora_adapter: Optional[str] = None
     ) -> None:
         # Compute effective model name: use LoRA adapter if provided, otherwise use client's model name

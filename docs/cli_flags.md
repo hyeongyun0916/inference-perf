@@ -162,6 +162,9 @@ Security: Filter expressions use eval() and should only contain trusted input. |
 | `--data.otel_trace_replay.disable_output_substitution` | boolean | When True, replay each call with its recorded assistant output (text and tool calls) instead of substituting the live output from predecessor calls. Dependency timing (waiting for predecessors) is still enforced. Default False preserves faithful live-output replay. |
 | `--data.otel_trace_replay.attribute_to_header_map` | JSON | Map OTel span attributes to HTTP headers |
 | `--data.otel_trace_replay.attribute_to_label_map` | JSON | Map OTel span attributes to metrics reporting labels |
+| `--data.otel_trace_replay.send_order_file` | str | File of recorded request send order, one line per request whose last whitespace-separated token is the event key. When set, each request waits until every earlier recorded position has been sent, so two runs present the server the same arrival order. |
+| `--data.otel_trace_replay.send_order_timeout_s` | float | Seconds a request waits on one earlier send_order_file position before giving up on that position (logged as a send-order violation) and moving on. |
+| `--data.otel_trace_replay.max_inflight_requests` | int | Cap on requests outstanding at the server at once, held across retries. Unlike concurrent_sessions it leaves every session live, so only the server's queue depth changes. None = no cap. |
 | `--data.weka_trace_replay.use_static_model` | boolean | Use a single static model for all requests |
 | `--data.weka_trace_replay.static_model_name` | str | Static model name (required if use_static_model=True) |
 | `--data.weka_trace_replay.model_mapping` | JSON | Map recorded model names to target models |
