@@ -165,6 +165,8 @@ Security: Filter expressions use eval() and should only contain trusted input. |
 | `--data.otel_trace_replay.send_order_file` | str | File of recorded request send order, one line per request whose last whitespace-separated token is the event key. When set, each request waits until every earlier recorded position has been sent, so two runs present the server the same arrival order. |
 | `--data.otel_trace_replay.send_order_timeout_s` | float | Seconds a request waits on one earlier send_order_file position before giving up on that position (logged as a send-order violation) and moving on. |
 | `--data.otel_trace_replay.max_inflight_requests` | int | Cap on requests outstanding at the server at once, held across retries. Unlike concurrent_sessions it leaves every session live, so only the server's queue depth changes. None = no cap. |
+| `--data.otel_trace_replay.retention_policy.table_path` | str | JSON retention table {event_key: [[start, end, priority], ...]}, end null meaning the end of the prompt: per-event token-range runs, non-increasing in priority, sent verbatim as kv.retain directives. Events absent from the table get none. |
+| `--data.otel_trace_replay.retention_policy.duration_s` | float | Retention duration in seconds attached to every directive. |
 | `--data.weka_trace_replay.use_static_model` | boolean | Use a single static model for all requests |
 | `--data.weka_trace_replay.static_model_name` | str | Static model name (required if use_static_model=True) |
 | `--data.weka_trace_replay.model_mapping` | JSON | Map recorded model names to target models |

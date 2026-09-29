@@ -60,6 +60,7 @@ from inference_perf.config import APIConfig, APIType, DataConfig, SessionReplayC
 from inference_perf.config.datagen.replay import BadToolCallHandling, ToolChoiceMode
 from inference_perf.datagen.base import LazyLoadDataMixin, SessionGenerator
 from inference_perf.datagen.replay.replay_graph_types import InputSegment, ReplayGraph
+from inference_perf.policies import TableRetentionPolicy, build_kv_hints
 from inference_perf.utils.custom_tokenizer import CustomTokenizer
 
 logger = logging.getLogger(__name__)
@@ -550,11 +551,19 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
     # generic fallback.
     _substitution_failure_reason: Optional[str] = None
     _substitution_failure_cause: Optional[SessionFailureCause] = None
+    retention_policy: Optional[TableRetentionPolicy] = None
 
     async def to_request_body(
         self, effective_model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool
     ) -> Dict[str, Any]:
         payload = await super().to_request_body(effective_model_name, max_tokens, ignore_eos, streaming)
+
+        # Before the tool-choice step, whose as_recorded branch returns early.
+        extra = self._compute_retention_extra_body()
+        if extra:
+            existing_extra = payload.get("extra_body") or {}
+            existing_extra.update(extra)
+            payload["extra_body"] = existing_extra
 
         if self.expected_output_is_tool_call and self.tool_definitions:
             # A forced tool call MUST stop at its natural end-of-sequence: the model
@@ -620,6 +629,15 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
             payload["ignore_eos"] = False
 
         return payload
+
+    def _compute_retention_extra_body(self) -> Optional[Dict[str, Any]]:
+        """The kv_hints envelope for this event, or None (no policy, or no table entry: LRU)."""
+        if self.retention_policy is None:
+            return None
+        directives = self.retention_policy.directives(self.event_id)
+        if not directives:
+            return None
+        return {"kv_hints": build_kv_hints(self._extract_session_id(), directives, self.event_id)}
 
     def _extract_session_id(self) -> str:
         return self.event_id.split(":")[0] if ":" in self.event_id else self.event_id
@@ -1522,6 +1540,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
         base_seed: Optional[int] = None,
         num_workers: int = 1,
         replay_config: Optional[SessionReplayConfig] = None,
+        retention_policy: Optional[TableRetentionPolicy] = None,
     ) -> None:
         super().__init__(api_config, config, tokenizer)
         self.config = config
@@ -1529,6 +1548,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
         self.mp_manager = mp_manager
         self.num_workers = max(1, num_workers)
         self.base_seed = base_seed if base_seed is not None else 42
+        self.retention_policy = retention_policy
 
         self.output_registry = EventOutputRegistry()
         self.worker_tracker = WorkerSessionTracker()
@@ -2109,6 +2129,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
             else False,
             # Back-reference so the event can evict this session from the worker once drained.
             generator=self,
+            retention_policy=getattr(self, "retention_policy", None),
         )
         api_data.graph_event_id = raw_event_id
         return api_data

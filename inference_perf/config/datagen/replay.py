@@ -127,6 +127,19 @@ class ConversationReplayConfig(StrictBaseModel):
     max_model_len: Optional[int] = Field(None, description="Maximum model context length in tokens")
 
 
+class RetentionPolicyConfig(StrictBaseModel):
+    """KV-cache retention hints sent from a precomputed retention table."""
+
+    table_path: str = Field(
+        description=(
+            "JSON retention table {event_key: [[start, end, priority], ...]}, end null meaning the end of the prompt: "
+            "per-event token-range runs, non-increasing in priority, sent verbatim as kv.retain directives. "
+            "Events absent from the table get none."
+        ),
+    )
+    duration_s: float = Field(86400.0, description="Retention duration in seconds attached to every directive.")
+
+
 class SessionReplayConfig(StrictBaseModel):
     """Base configuration for session replay data generators."""
 
@@ -270,6 +283,10 @@ class OTelTraceReplayConfig(SessionReplayConfig):
             "concurrent_sessions it leaves every session live, so only the server's queue depth "
             "changes. None = no cap."
         ),
+    )
+    retention_policy: Optional[RetentionPolicyConfig] = Field(
+        None,
+        description="When set, each request carries the kv_hints retention envelope for its event from table_path.",
     )
 
     @model_validator(mode="after")

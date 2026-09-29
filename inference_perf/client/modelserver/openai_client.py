@@ -526,6 +526,11 @@ class openAIModelServerClientSession(ModelServerClientSession):
             if session_token:
                 headers[session_token_header] = session_token
 
+        # vLLM's raw HTTP API doesn't unwrap the OpenAI-SDK `extra_body` wrapper;
+        # flatten to top level so params like kv_hints reach vLLM.
+        if isinstance(payload.get("extra_body"), dict):
+            payload.update(payload.pop("extra_body"))
+
         request_data = json.dumps(payload)
 
         # Determine operation name based on API type

@@ -91,6 +91,7 @@ from inference_perf.datagen.replay.trace_source import (
     TraceSource,
     TraceSourceError,
 )
+from inference_perf.policies import TableRetentionPolicy
 from inference_perf.utils.custom_tokenizer import CustomTokenizer
 from inference_perf.utils.dataset import load_dataset_with_deadline
 from inference_perf.apis import InferenceAPIData, LazyLoadInferenceAPIData
@@ -402,6 +403,7 @@ class OTelTraceReplayDataGenerator(ReplayGraphSessionGeneratorBase):
         mp_manager: Optional[SyncManager] = None,
         base_seed: Optional[int] = None,
         num_workers: int = 1,
+        retention_policy: Optional[TableRetentionPolicy] = None,
     ) -> None:
         if not hasattr(config, "otel_trace_replay") or config.otel_trace_replay is None:
             raise ValueError("otel_trace_replay configuration is required for OTelTraceReplayDataGenerator")
@@ -417,6 +419,7 @@ class OTelTraceReplayDataGenerator(ReplayGraphSessionGeneratorBase):
             base_seed=base_seed,
             num_workers=num_workers,
             replay_config=self.otel_config,
+            retention_policy=retention_policy,
         )
 
         self.mp_manager = mp_manager

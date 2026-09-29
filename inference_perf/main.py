@@ -81,6 +81,7 @@ from inference_perf.reportgen import ReportGenerator
 from inference_perf.utils import CustomTokenizer, ReportFile, add_global_args, add_pydantic_args, unflatten_dict
 from inference_perf.utils.cli_summary import print_summary_table
 from inference_perf.observability.logging import setup_logging
+from inference_perf.policies import TableRetentionPolicy
 import asyncio
 import time
 
@@ -408,8 +409,15 @@ def main_cli() -> None:
         elif config.data.type == DataGenType.VisionArena:
             datagen = VisionArenaDataGenerator(config.api, config.data, tokenizer)
         elif config.data.type == DataGenType.OTelTraceReplay:
+            retention = config.data.otel_trace_replay.retention_policy if config.data.otel_trace_replay else None
             datagen = OTelTraceReplayDataGenerator(
-                config.api, config.data, tokenizer, mp_manager, config.load.base_seed, num_workers=config.load.num_workers
+                config.api,
+                config.data,
+                tokenizer,
+                mp_manager,
+                config.load.base_seed,
+                num_workers=config.load.num_workers,
+                retention_policy=TableRetentionPolicy(retention.table_path, retention.duration_s) if retention else None,
             )
         elif config.data.type == DataGenType.WekaTraceReplay:
             datagen = WekaTraceReplayDataGenerator(
