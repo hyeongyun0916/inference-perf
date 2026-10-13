@@ -552,6 +552,9 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
     _substitution_failure_reason: Optional[str] = None
     _substitution_failure_cause: Optional[SessionFailureCause] = None
     retention_policy: Optional[TableRetentionPolicy] = None
+    # Counts live vs recorded message tokens so a live policy can shift its
+    # recorded token ranges onto a prompt with substituted predecessor outputs.
+    tokenizer: Optional[Any] = None
 
     async def to_request_body(
         self, effective_model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool
@@ -634,13 +637,47 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
         """The kv_hints envelope for this event, or None (no policy, or no table entry: LRU)."""
         if self.retention_policy is None:
             return None
-        directives = self.retention_policy.directives(self.event_id)
+        directives = self.retention_policy.directives(self.event_id, msg_deltas=self._live_message_deltas())
         if not directives:
             return None
         return {"kv_hints": build_kv_hints(self._extract_session_id(), directives, self.event_id)}
 
     def _extract_session_id(self) -> str:
         return self.event_id.split(":")[0] if ":" in self.event_id else self.event_id
+
+    def _live_message_deltas(self) -> Optional[List[int]]:
+        """Per message, live token count minus recorded (0 where the wire message
+        is the recorded one). None when nothing was substituted, no tokenizer is
+        available, or substitution changed the message count (no safe mapping)."""
+        if self.disable_output_substitution or not self.input_segments or self.tokenizer is None:
+            return None
+        if len(self.messages) != len(self.original_messages):
+            return None
+
+        def text_of(m: Any) -> str:
+            if isinstance(m, dict):
+                content, tool_calls = m.get("content"), m.get("tool_calls")
+            else:
+                content, tool_calls = getattr(m, "content", None), getattr(m, "tool_calls", None)
+            parts: List[str] = []
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                parts.append(json.dumps(content, ensure_ascii=False, sort_keys=True))
+            if tool_calls:
+                parts.append(json.dumps(tool_calls, ensure_ascii=False, sort_keys=True))
+            return "\n".join(parts)
+
+        deltas: List[int] = []
+        changed = False
+        for live, rec in zip(self.messages, self.original_messages, strict=False):
+            lt, rt = text_of(live), text_of(rec)
+            if lt == rt:
+                deltas.append(0)
+                continue
+            changed = True
+            deltas.append(self.tokenizer.count_tokens(lt) - self.tokenizer.count_tokens(rt))
+        return deltas if changed else None
 
     def _fail_and_notify(self, session_id: str, cause: SessionFailureCause, reason: str) -> None:
         """Mark this event and session as failed, notify the completion queue.
@@ -2107,6 +2144,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
             wait_ms=event.wait_ms,
             input_segments=event.input_segments,
             original_messages=original_messages,
+            tokenizer=getattr(self, "tokenizer", None),
             expected_output_content=event.expected_output,
             expected_output_is_tool_call=gc.expected_output_is_tool_call if gc else False,
             expected_output_tool_names=gc.expected_output_tool_names if gc else None,

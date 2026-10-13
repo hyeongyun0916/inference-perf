@@ -19,7 +19,7 @@ from argparse import ArgumentParser
 
 import yaml
 from inference_perf.analysis.analyze import analyze_reports
-from typing import List, Optional
+from typing import Any, List, Optional
 from inference_perf.client.modelserver.tgi_client import TGImodelServerClient
 from inference_perf.datagen.base import BaseGenerator
 from inference_perf.loadgen import LoadGenerator
@@ -140,6 +140,15 @@ class InferencePerfRunner:
 
     def stop(self) -> None:
         asyncio.run(self.loadgen.stop())
+
+
+def _retention_policy(config: Any, retention: Any) -> Optional[TableRetentionPolicy]:
+    """Generated tokens are protected only when they reach the next prompt (live output substitution)."""
+    if not retention:
+        return None
+    replay = config.data.otel_trace_replay
+    protect_output = not getattr(replay, "disable_output_substitution", False)
+    return TableRetentionPolicy(retention.table_path, retention.duration_s, protect_output)
 
 
 def main_cli() -> None:
@@ -417,7 +426,7 @@ def main_cli() -> None:
                 mp_manager,
                 config.load.base_seed,
                 num_workers=config.load.num_workers,
-                retention_policy=TableRetentionPolicy(retention.table_path, retention.duration_s) if retention else None,
+                retention_policy=_retention_policy(config, retention),
             )
         elif config.data.type == DataGenType.WekaTraceReplay:
             datagen = WekaTraceReplayDataGenerator(
